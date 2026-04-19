@@ -101,9 +101,9 @@ app.get("/api/v1/procesos/:nidProceso/documentos/:filename", async (req, res) =>
   }
 });
 
-const port = process.env.PORT || 3000;
-const server = app.listen(port, () => {
-  console.log(`🚀 SEACE API http://localhost:${port}`);
+const port = Number(process.env.PORT) || 3000;
+const server = app.listen(port, "0.0.0.0", () => {
+  console.log(`🚀 SEACE API listening on 0.0.0.0:${port}`);
   console.log("  GET /health");
   console.log("  GET /api/v1/procesos");
   console.log("  GET /api/v1/procesos/:nidProceso");
