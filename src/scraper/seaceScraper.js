@@ -4,7 +4,8 @@ import { config } from "../config/config.js";
 
 export async function scrapeSeace({ limit = 10 } = {}) {
   return withPage(async (page) => {
-    await page.goto(config.baseUrl);
+    await page.goto(config.baseUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.waitForSelector("a[href='#tbBuscador\\:tab1']", { timeout: 60000 });
     await page.click("a[href='#tbBuscador\\:tab1']");
     await page.waitForTimeout(1500);
     await page.click("#tbBuscador\\:idFormBuscarProceso\\:btnBuscarSelToken");

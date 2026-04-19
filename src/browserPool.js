@@ -18,7 +18,11 @@ async function getBrowser() {
 
 export async function withPage(fn) {
   const b = await getBrowser();
-  const ctx = await b.newContext();
+  const ctx = await b.newContext({
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    viewport: { width: 1366, height: 900 },
+    locale: "es-PE",
+  });
   const page = await ctx.newPage();
   try {
     return await fn(page);
