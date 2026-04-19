@@ -42,7 +42,8 @@ app.get("/api/v1/procesos", async (req, res) => {
     listCache.set("top", data);
     res.json({ data, cached: false });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("❌", req.path, e);
+    res.status(500).json({ error: e.message, stack: e.stack });
   }
 });
 
@@ -67,7 +68,8 @@ app.get("/api/v1/procesos/:nidProceso", async (req, res) => {
     detalleCache.set(nidProceso, data);
     res.json({ data, cached: false });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("❌", req.path, e);
+    res.status(500).json({ error: e.message, stack: e.stack });
   }
 });
 
@@ -97,7 +99,8 @@ app.get("/api/v1/procesos/:nidProceso/documentos/:filename", async (req, res) =>
     res.setHeader("Content-Type", "application/octet-stream");
     res.send(out.buffer);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("❌", req.path, e);
+    res.status(500).json({ error: e.message, stack: e.stack });
   }
 });
 
