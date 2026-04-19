@@ -31,6 +31,27 @@ function once(key, fn) {
 
 app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
 
+// debug: ¿qué devuelve SEACE desde Railway?
+app.get("/debug", async (_req, res) => {
+  const { withPage } = await import("./src/browserPool.js");
+  const { config } = await import("./src/config/config.js");
+  try {
+    const out = await withPage(async (page) => {
+      const resp = await page.goto(config.baseUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(3000);
+      return {
+        status: resp?.status(),
+        url: page.url(),
+        title: await page.title(),
+        bodySnippet: (await page.content()).slice(0, 3000),
+      };
+    });
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // listado top 10
 app.get("/api/v1/procesos", async (req, res) => {
   try {
