@@ -78,12 +78,26 @@ async function newContext(b) {
   });
 
   // bloquear recursos pesados / tracking (tipos según modo headless vs headed)
+  // IMPORTANTE: imgs de SEACE (fichaSeleccion.gif, btnLupa.gif, etc) se permiten
+  // porque son iconos UI pequeños y sin ellos los botones quedan 0×0 →
+  // Playwright marca como "not visible" aunque estén en DOM.
   const blockedTypes = getBlockedTypes();
   await ctx.route("**/*", (route) => {
     const req = route.request();
-    if (blockedTypes.has(req.resourceType())) return route.abort();
     const url = req.url();
+    const type = req.resourceType();
+
+    // tracking/ads siempre bloqueado
     if (BLOCKED_URL_PATTERNS.some((p) => p.test(url))) return route.abort();
+
+    // imgs: bloquear solo externas (SEACE propias no → iconos UI botones)
+    if (type === "image") {
+      const isSeace = /seace\.gob\.pe|\.seace\./i.test(url) || url.startsWith("data:");
+      if (isSeace) return route.continue();
+      return route.abort();
+    }
+
+    if (blockedTypes.has(type)) return route.abort();
     return route.continue();
   });
 

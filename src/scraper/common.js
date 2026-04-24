@@ -369,13 +369,28 @@ export async function findRow(page, { nomenclatura, nidProceso, maxPages = 20 })
 
 /**
  * Abre ficha (detalle) de una fila.
+ *
+ * IMPORTANTE: el botón ficha es solo <a><img></a>. Con block de imgs
+ * activado (headless perf), el <img> no carga → <a> queda 0×0 → Playwright
+ * marca "not visible" y el click falla con timeout.
+ *
+ * Workaround: disparar click vía DOM directo (el.click()) — bypassa
+ * chequeos de visibilidad. El onclick handler se ejecuta igual.
  */
 export async function openFicha(page, rowHandle) {
   const rowEl = rowHandle.asElement();
   if (!rowEl) throw new Error("row handle inválido");
   const btn = await rowEl.$(SEL.fichaBtn);
   if (!btn) throw new Error("botón ficha no encontrado en fila");
-  await btn.click();
+
+  // esperar navegación o mutación post-submit, en paralelo al click
+  const navWait = page
+    .waitForNavigation({ waitUntil: "domcontentloaded", timeout: T.ficha })
+    .catch(() => null);
+
+  await btn.evaluate((el) => el.click());
+
+  await navWait;
   await page.waitForSelector(SEL.fichaReady, { timeout: T.ficha });
   await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
 }
