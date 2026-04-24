@@ -2,12 +2,46 @@
 // Import directo al módulo interno evita el issue.
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 
+// patrones de warnings ruidosos de pdfjs-dist que podemos ignorar.
+// Solo afectan a fidelidad visual de fuentes; la extracción de texto sigue OK.
+const NOISY_PATTERNS = [
+  /Ran out of space in font private use area/i,
+  /TT: undefined function/i,
+  /Warning: Indexing all PDF objects/i,
+  /Warning: Unsupported feature/i,
+  /Warning: getPdfManager/i,
+];
+
+function isNoisy(args) {
+  const msg = args.map((a) => (typeof a === "string" ? a : "")).join(" ");
+  return NOISY_PATTERNS.some((p) => p.test(msg));
+}
+
+/**
+ * Silencia temporalmente warnings ruidosos de pdfjs mientras se ejecuta fn().
+ */
+async function suppressPdfNoise(fn) {
+  const origWarn = console.warn;
+  const origLog = console.log;
+  const origErr = console.error;
+  console.warn = (...args) => { if (!isNoisy(args)) origWarn(...args); };
+  console.log = (...args) => { if (!isNoisy(args)) origLog(...args); };
+  console.error = (...args) => { if (!isNoisy(args)) origErr(...args); };
+  try {
+    return await fn();
+  } finally {
+    console.warn = origWarn;
+    console.log = origLog;
+    console.error = origErr;
+  }
+}
+
 /**
  * Extrae texto plano de un PDF (Buffer).
  * Retorna { text, numPages, info, meta } o lanza si corrupto.
  */
 export async function extractText(buffer) {
-  const result = await pdfParse(buffer);
+  const result = await suppressPdfNoise(() => pdfParse(buffer));
   return {
     text: result.text || "",
     numPages: result.numpages || 0,
