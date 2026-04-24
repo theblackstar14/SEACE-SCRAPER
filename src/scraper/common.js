@@ -75,15 +75,48 @@ async function ensureAvanzadaOpen(page) {
 }
 
 /**
- * Llena input datepicker PrimeFaces. Usa fill directo y dispara blur para sincronizar widget.
+ * Llena input datepicker PrimeFaces de forma robusta.
+ *
+ * Estrategia:
+ *  1. focus input
+ *  2. select-all + delete (limpia cualquier valor previo)
+ *  3. type (dispara keydown/keyup/input por caracter → widget registra)
+ *  4. Escape (cerrar calendar popup)
+ *  5. dispatch change + blur explícitos (PrimeFaces valida onchange)
+ *
+ * `fill()` solo es directo + change, que muchas veces NO es suficiente
+ * para PrimeFaces datepickers — el widget valida/reformatea en keyup.
  */
 async function setDatepicker(page, selector, value) {
   if (!value) return;
-  await page.click(selector);
-  await page.fill(selector, value);
-  await page.keyboard.press("Escape"); // cerrar calendar popup si apareció
-  // blur para que PrimeFaces registre
-  await page.evaluate((sel) => document.querySelector(sel)?.blur(), selector);
+  const input = page.locator(selector);
+  await input.waitFor({ state: "visible", timeout: 5000 });
+
+  // limpiar
+  await input.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Delete");
+
+  // escribir simulando teclado real
+  await page.keyboard.type(value, { delay: 30 });
+
+  // cerrar calendar si abrió
+  await page.keyboard.press("Escape");
+
+  // disparar change + blur explícitos (PrimeFaces puede esperar estos)
+  await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return;
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    el.dispatchEvent(new Event("blur", { bubbles: true }));
+    el.blur();
+  }, selector);
+
+  // verificar que quedó el valor (si no, warn)
+  const actual = await input.inputValue().catch(() => "");
+  if (actual !== value) {
+    console.warn(`[datepicker] ${selector} quedó "${actual}", esperado "${value}"`);
+  }
 }
 
 /**
@@ -151,6 +184,21 @@ export async function openBuscador(page, filters = {}) {
     }
   }
 
+  // log del estado de filtros antes de buscar (debug)
+  const filterState = await page.evaluate(
+    ({ labelId, fIni, fFin }) => ({
+      objetoLabel: document.querySelector(labelId)?.textContent?.trim() || null,
+      fechaIni: document.querySelector(fIni)?.value || null,
+      fechaFin: document.querySelector(fFin)?.value || null,
+    }),
+    {
+      labelId: SEL.objetoLabel,
+      fIni: SEL.fechaInicioInput,
+      fFin: SEL.fechaFinInput,
+    }
+  );
+  console.log(`[openBuscador] filtros aplicados: ${JSON.stringify(filterState)}`);
+
   // disparar búsqueda, esperando XHR JSF
   await waitJsfCycle(page, {
     trigger: () => page.click(SEL.btnBuscar),
@@ -161,6 +209,23 @@ export async function openBuscador(page, filters = {}) {
 
   // maximizar rows-per-page para reducir pagination
   await setMaxRowsPerPage(page).catch(() => {});
+
+  // si no hay filas, dump screenshot + HTML para debug
+  const rowCount = await page.$$eval(SEL.resultsRows, (rs) => rs.length).catch(() => 0);
+  if (rowCount === 0 && (filters.fechaDesde || filters.fechaHasta || filters.objetoContratacion)) {
+    try {
+      const debugDir = "./data/debug";
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      await mkdir(debugDir, { recursive: true });
+      const ts = Date.now();
+      await page.screenshot({ path: `${debugDir}/empty-${ts}.png`, fullPage: true });
+      const html = await page.content();
+      await writeFile(`${debugDir}/empty-${ts}.html`, html);
+      console.warn(`[openBuscador] 0 resultados con filtros — dump: ${debugDir}/empty-${ts}.{png,html}`);
+    } catch (e) {
+      console.warn(`[openBuscador] no pude guardar debug: ${e.message}`);
+    }
+  }
 }
 
 /**
