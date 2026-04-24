@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "obra": "node src/cli/run-obra.js",
+    "obra:debug": "node src/cli/run-obra.js --skip-pdf --limit 5"
   },
   "keywords": [],
   "author": "",
@@ -14,7 +16,14 @@
     "axios": "^1.15.1",
     "cheerio": "^1.2.0",
     "dotenv": "^17.4.2",
+    "adm-zip": "^0.5.16",
     "express": "^5.2.1",
-    "playwright": "^1.59.1"
+    "express-rate-limit": "^7.4.1",
+    "lru-cache": "^11.0.2",
+    "node-unrar-js": "^2.0.2",
+    "p-limit": "^6.1.0",
+    "pdf-parse": "^1.1.1",
+    "playwright": "^1.59.1",
+    "zod": "^3.23.8"
   }
 }
