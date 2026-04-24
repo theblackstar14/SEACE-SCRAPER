@@ -162,8 +162,9 @@ app.get("/api/v1/procesos/:nidProceso", async (req, res) => {
         error: "Falta nomenclatura. Llama primero a GET /api/v1/procesos o pasa ?nomenclatura=",
       });
     }
+    const nidConvocatoria = req.query.nidConvocatoria || meta?.nidConvocatoria;
     const { data, source } = await swr(detalleCache, nidProceso, () =>
-      scrapeDetalle({ nomenclatura, nidProceso })
+      scrapeDetalle({ nomenclatura, nidProceso, nidConvocatoria })
     );
     res.json({ data, source });
   } catch (e) {
@@ -182,8 +183,9 @@ app.get("/api/v1/procesos/:nidProceso/documentos/:filename", async (req, res) =>
       return res.status(400).json({ error: "Falta nomenclatura (?nomenclatura=...)" });
     }
 
+    const nidConvocatoria = req.query.nidConvocatoria || meta?.nidConvocatoria;
     const { data: out } = await swr(pdfCache, key, () =>
-      descargarDoc({ nomenclatura, nidProceso, filename })
+      descargarDoc({ nomenclatura, nidProceso, nidConvocatoria, filename })
     );
 
     const safeName = sanitizeFilename(out.filename);

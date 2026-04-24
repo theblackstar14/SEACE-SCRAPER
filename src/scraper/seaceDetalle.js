@@ -32,10 +32,10 @@ function fieldByLabels($, labels) {
   return val;
 }
 
-export async function scrapeDetalle({ nomenclatura, nidProceso, filters }) {
+export async function scrapeDetalle({ nomenclatura, nidProceso, nidConvocatoria, filters }) {
   return withPage(async (page) => {
     const t0 = Date.now();
-    await navigateToFicha(page, { nomenclatura, nidProceso, filters });
+    await navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters });
     const html = await page.content();
     const $ = cheerio.load(html);
 
@@ -112,9 +112,9 @@ export async function scrapeDetalle({ nomenclatura, nidProceso, filters }) {
   });
 }
 
-export async function descargarDoc({ nomenclatura, nidProceso, filename, filters }) {
+export async function descargarDoc({ nomenclatura, nidProceso, nidConvocatoria, filename, filters }) {
   return withPage(async (page) => {
-    await navigateToFicha(page, { nomenclatura, nidProceso, filters });
+    await navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters });
 
     const dlAnchor = await page.evaluateHandle((fname) => {
       const anchors = document.querySelectorAll("a[onclick*='descargaDocGeneral']");

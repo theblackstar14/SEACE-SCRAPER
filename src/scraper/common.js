@@ -175,19 +175,49 @@ export async function getPaginatorInfo(page) {
 
 /**
  * Itera todas las páginas de resultados y acumula filas.
- * @param {object} opts
- *   - maxRows: cota máxima de filas a acumular
- *   - maxPages: cota máxima de páginas a visitar
+ * Dedup por nidProceso. Para temprano si:
+ *   - paginator_info dice "Página X/Y" y X === Y
+ *   - next click no agrega filas nuevas (página repetida)
+ *   - se alcanza maxRows / maxPages
  */
 export async function collectAllPages(page, { maxRows = Infinity, maxPages = 50 } = {}) {
   const all = [];
+  const seen = new Set();
   let pageIdx = 0;
+  let consecutiveDupPages = 0;
 
   while (pageIdx < maxPages) {
     const html = await page.$eval(SEL.resultsPanel, (el) => el.innerHTML);
     const rows = parseTable(html);
-    all.push(...rows);
+
+    let newInPage = 0;
+    for (const r of rows) {
+      const key = r.nidProceso || `${r.nomenclatura}|${r.fechaPublicacion}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        all.push(r);
+        newInPage++;
+      }
+    }
+
     if (all.length >= maxRows) return all.slice(0, maxRows);
+
+    // si esta página no aportó nuevas filas, probable fin (paginator no cierra bien)
+    if (newInPage === 0) {
+      consecutiveDupPages++;
+      if (consecutiveDupPages >= 2) {
+        console.log(`[collectAllPages] stop: 2 páginas sin filas nuevas (${all.length} únicas)`);
+        break;
+      }
+    } else {
+      consecutiveDupPages = 0;
+    }
+
+    // check paginator: si página actual === total, stop
+    const info = await getPaginatorInfo(page);
+    if (info && info.page >= info.pages) {
+      break;
+    }
 
     const next = await page.$(SEL.paginatorNext);
     if (!next) break;
@@ -256,13 +286,89 @@ export async function openFicha(page, rowHandle) {
 }
 
 /**
- * Flow: abre buscador (con filtros opcionales) → busca fila → abre ficha.
+ * Navega DIRECTO a la ficha usando PrimeFaces.addSubmitParam + submit del form.
+ * Requiere nidProceso + nidConvocatoria (ambos capturados del listado).
+ *
+ * Mucho más rápido y robusto que buscar por paginación.
+ * Basado en el onclick real del link "Ficha Selección":
+ *   PrimeFaces.addSubmitParam('tbBuscador:idFormBuscarProceso', {
+ *     'ntipo': '1',
+ *     'nidConvocatoria': '...',
+ *     'nidProceso': '...',
+ *     'nidSistema': '3',
+ *     'ptoRetorno': 'LOCAL'
+ *   }).submit('tbBuscador:idFormBuscarProceso');
  */
-export async function navigateToFicha(page, { nomenclatura, nidProceso, filters }) {
+export async function navigateToFichaDirect(page, { nidProceso, nidConvocatoria, nidSistema = "3" }) {
+  if (!nidProceso || !nidConvocatoria) {
+    throw new Error("navigateToFichaDirect requiere nidProceso + nidConvocatoria");
+  }
+
+  await withRetry(
+    async () => {
+      await page.goto(config.baseUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: T.goto,
+      });
+    },
+    { label: "goto baseUrl (fichaDirect)" }
+  );
+
+  // asegurar tab buscador activo (el form vive en ese tab)
+  await page.waitForSelector(SEL.tabBuscador, { timeout: T.selector });
+  await page.click(SEL.tabBuscador);
+  await page.waitForSelector(SEL.btnBuscar, { state: "visible", timeout: T.selector });
+
+  // disparar submit del form con params de ficha
+  const navResp = page
+    .waitForNavigation({ waitUntil: "domcontentloaded", timeout: T.ficha })
+    .catch(() => null);
+
+  await page.evaluate(
+    ({ nidProceso, nidConvocatoria, nidSistema }) => {
+      const formId = "tbBuscador:idFormBuscarProceso";
+      // eslint-disable-next-line no-undef
+      if (typeof PrimeFaces === "undefined" || !PrimeFaces.addSubmitParam) {
+        throw new Error("PrimeFaces no disponible");
+      }
+      // eslint-disable-next-line no-undef
+      PrimeFaces.addSubmitParam(formId, {
+        ntipo: "1",
+        nidConvocatoria,
+        nidProceso,
+        nidSistema,
+        ptoRetorno: "LOCAL",
+      }).submit(formId);
+    },
+    { nidProceso, nidConvocatoria, nidSistema }
+  );
+
+  await navResp;
+
+  // esperar panel ficha listo (o texto "Entidad Convocante")
+  await page.waitForSelector(SEL.fichaReady, { timeout: T.ficha });
+  await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+}
+
+/**
+ * Flow legacy (fallback): abre buscador → busca fila → abre ficha.
+ * Usar solo si NO tenemos nidConvocatoria (raro).
+ */
+export async function navigateToFichaViaBuscador(page, { nomenclatura, nidProceso, filters }) {
   await openBuscador(page, filters || {});
   const row = await findRow(page, { nomenclatura, nidProceso });
   if (!row) throw new Error("Proceso no encontrado");
   await openFicha(page, row);
+}
+
+/**
+ * Flow smart: si hay nidConvocatoria usa directo; si no, fallback a buscador.
+ */
+export async function navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters }) {
+  if (nidProceso && nidConvocatoria) {
+    return navigateToFichaDirect(page, { nidProceso, nidConvocatoria });
+  }
+  return navigateToFichaViaBuscador(page, { nomenclatura, nidProceso, filters });
 }
 
 export { OBJETO };

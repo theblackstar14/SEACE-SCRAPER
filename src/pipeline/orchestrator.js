@@ -60,6 +60,8 @@ export async function runObraPipeline({
           const detalle = await scrapeDetalle({
             nomenclatura: p.nomenclatura,
             nidProceso: p.nidProceso,
+            nidConvocatoria: p.nidConvocatoria,
+            // filters solo se usan si nav-directa falla (raro)
             filters: {
               objetoContratacion: filters.objetoContratacion || "Obra",
               fechaDesde: filters.fechaDesde,
@@ -128,6 +130,7 @@ export async function runObraPipeline({
           const descarga = await downloadDocumento({
             nomenclatura: p.nomenclatura,
             nidProceso: p.nidProceso,
+            nidConvocatoria: p.nidConvocatoria,
             filename: sel.doc.descargas[0].filename,
             filters: {
               objetoContratacion: filters.objetoContratacion || "Obra",
