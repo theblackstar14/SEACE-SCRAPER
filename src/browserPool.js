@@ -9,7 +9,13 @@ const MAX_CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY) || 2;
 const limit = pLimit(MAX_CONCURRENCY);
 
 // recursos que no aportan al scrape — cortan 40-60% del tiempo de goto
-const BLOCKED_TYPES = new Set(["image", "font", "media", "stylesheet"]);
+// en modo headed (debug visual) NO bloqueamos CSS para que la página se vea normal
+// Lazy: se evalúa al crear contexto, no al import
+function getBlockedTypes() {
+  return config.headless
+    ? new Set(["image", "font", "media", "stylesheet"])
+    : new Set(["media"]);
+}
 const BLOCKED_URL_PATTERNS = [
   /google-analytics\.com/i,
   /googletagmanager\.com/i,
@@ -31,6 +37,12 @@ async function getBrowser() {
       "--disable-blink-features=AutomationControlled",
     ],
   };
+
+  // slow-mo útil para debugging visual cuando corres con HEADLESS=false
+  if (!config.headless && process.env.SLOW_MO) {
+    launchOpts.slowMo = Number(process.env.SLOW_MO) || 250;
+    console.log(`🐢 slowMo ${launchOpts.slowMo}ms`);
+  }
   if (process.env.PROXY_SERVER) {
     launchOpts.proxy = {
       server: process.env.PROXY_SERVER,
@@ -65,10 +77,11 @@ async function newContext(b) {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 
-  // bloquear recursos pesados / tracking
+  // bloquear recursos pesados / tracking (tipos según modo headless vs headed)
+  const blockedTypes = getBlockedTypes();
   await ctx.route("**/*", (route) => {
     const req = route.request();
-    if (BLOCKED_TYPES.has(req.resourceType())) return route.abort();
+    if (blockedTypes.has(req.resourceType())) return route.abort();
     const url = req.url();
     if (BLOCKED_URL_PATTERNS.some((p) => p.test(url))) return route.abort();
     return route.continue();

@@ -28,6 +28,8 @@ function parseArgs(argv) {
     else if (a === "--out") args.out = next, i++;
     else if (a === "--concurrency") args.concurrency = Number(next), i++;
     else if (a === "--skip-pdf") args.skipPdf = true;
+    else if (a === "--headed") args.headed = true;
+    else if (a === "--slow-mo") args.slowMo = Number(next) || 250, i++;
     else if (a === "--help" || a === "-h") {
       console.log(
         `Usage: node src/cli/run-obra.js [opts]\n` +
@@ -38,7 +40,9 @@ function parseArgs(argv) {
           `  --concurrency N    scrapes en paralelo (default 2)\n` +
           `  --empresa PATH     empresa.json (default ./data/empresa.json)\n` +
           `  --out DIR          carpeta de salida (default ./data/output)\n` +
-          `  --skip-pdf         no descarga/analiza PDFs (rápido para debug)\n`
+          `  --skip-pdf         no descarga/analiza PDFs (rápido para debug)\n` +
+          `  --headed           abre Chromium visible (debug visual)\n` +
+          `  --slow-mo N        delay en ms entre acciones (default 250 si --headed)\n`
       );
       process.exit(0);
     }
@@ -48,6 +52,12 @@ function parseArgs(argv) {
 
 async function main() {
   const args = parseArgs(process.argv);
+
+  // aplicar modo headed antes de importar browserPool (via env)
+  if (args.headed) {
+    process.env.HEADLESS = "false";
+    process.env.SLOW_MO = String(args.slowMo || 250);
+  }
 
   // resolver fechas
   let fechaDesde = args.desde;

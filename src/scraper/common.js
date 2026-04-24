@@ -77,45 +77,69 @@ async function ensureAvanzadaOpen(page) {
 /**
  * Llena input datepicker PrimeFaces de forma robusta.
  *
- * Estrategia:
- *  1. focus input
- *  2. select-all + delete (limpia cualquier valor previo)
- *  3. type (dispara keydown/keyup/input por caracter → widget registra)
- *  4. Escape (cerrar calendar popup)
- *  5. dispatch change + blur explícitos (PrimeFaces valida onchange)
+ * PrimeFaces usa jQuery UI datepicker internamente. La forma 100% confiable
+ * es invocar `$(input).datepicker('setDate', Date)` — el mismo método que el
+ * widget usa al seleccionar en el calendar. Esto actualiza tanto el input
+ * visual como el state interno de PrimeFaces/jQuery UI.
  *
- * `fill()` solo es directo + change, que muchas veces NO es suficiente
- * para PrimeFaces datepickers — el widget valida/reformatea en keyup.
+ * Fallback: si jQuery UI no está, emula type() + eventos.
  */
 async function setDatepicker(page, selector, value) {
   if (!value) return;
   const input = page.locator(selector);
   await input.waitFor({ state: "visible", timeout: 5000 });
 
-  // limpiar
-  await input.click();
-  await page.keyboard.press("Control+A");
-  await page.keyboard.press("Delete");
+  // cerrar cualquier datepicker popup previamente abierto
+  await page.evaluate(() => {
+    if (window.jQuery?.datepicker?._hideDatepicker) {
+      try {
+        window.jQuery.datepicker._hideDatepicker();
+      } catch {}
+    }
+  });
 
-  // escribir simulando teclado real
-  await page.keyboard.type(value, { delay: 30 });
+  // vía jQuery UI datepicker (preferido)
+  const setOk = await page.evaluate(
+    ({ sel, val }) => {
+      // el selector tiene escapes CSS (\:), usamos querySelector directo
+      const el = document.querySelector(sel);
+      if (!el) return { ok: false, reason: "input no encontrado" };
 
-  // cerrar calendar si abrió
-  await page.keyboard.press("Escape");
+      const [dd, mm, yyyy] = val.split("/").map(Number);
+      if (!dd || !mm || !yyyy) return { ok: false, reason: "fecha mal formada" };
+      const date = new Date(yyyy, mm - 1, dd);
 
-  // disparar change + blur explícitos (PrimeFaces puede esperar estos)
-  await page.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    if (!el) return;
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    el.dispatchEvent(new Event("blur", { bubbles: true }));
-    el.blur();
-  }, selector);
+      if (window.jQuery && window.jQuery(el).datepicker) {
+        try {
+          // setDate actualiza input visual + state interno; onSelect handler se dispara
+          window.jQuery(el).datepicker("setDate", date);
+          // trigger eventos por si hay listeners extra
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.dispatchEvent(new Event("blur", { bubbles: true }));
+          return { ok: true, via: "jQuery.datepicker" };
+        } catch (e) {
+          return { ok: false, reason: `jQuery.datepicker fail: ${e.message}` };
+        }
+      }
 
-  // verificar que quedó el valor (si no, warn)
+      // fallback crudo: set value + events
+      el.value = val;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("blur", { bubbles: true }));
+      return { ok: true, via: "raw value+events" };
+    },
+    { sel: selector, val: value }
+  );
+
+  if (!setOk.ok) {
+    console.warn(`[datepicker] ${selector} no se pudo setear: ${setOk.reason}`);
+  }
+
+  // verificar valor final
   const actual = await input.inputValue().catch(() => "");
   if (actual !== value) {
-    console.warn(`[datepicker] ${selector} quedó "${actual}", esperado "${value}"`);
+    console.warn(`[datepicker] ${selector} quedó "${actual}", esperado "${value}" (via=${setOk.via || "?"})`);
   }
 }
 
