@@ -171,10 +171,38 @@ export async function extractRequisitosWithClaudeText(text, { valorReferencial =
     throw new Error("ANTHROPIC_API_KEY no configurada");
   }
 
-  // truncar texto a ~40k chars (suficiente para Bases típicas)
+  // SMART TEXT SELECTION: si el texto es largo, buscar sección "Requisitos de
+  // Calificación" (donde vive experiencia mínima) y mandar esa ventana.
+  // Fallback a primeros N chars si no encontramos el anchor.
   const MAX_CHARS = 40000;
   const truncated = text.length > MAX_CHARS;
-  const textSlice = truncated ? text.slice(0, MAX_CHARS) : text;
+  let textSlice = text;
+  if (truncated) {
+    const tlow = text.toLowerCase();
+    const anchors = [
+      "requisitos de calificaci",
+      "requisitos de calif",
+      "experiencia del postor",
+      "capítulo iii",
+      "capitulo iii",
+    ];
+    let anchorIdx = -1;
+    for (const a of anchors) {
+      const idx = tlow.indexOf(a);
+      if (idx >= 0) {
+        anchorIdx = idx;
+        break;
+      }
+    }
+    if (anchorIdx >= 0) {
+      // ventana: 5k antes del anchor + 35k después
+      const start = Math.max(0, anchorIdx - 5000);
+      const end = Math.min(text.length, start + MAX_CHARS);
+      textSlice = text.slice(start, end);
+    } else {
+      textSlice = text.slice(0, MAX_CHARS);
+    }
+  }
 
   const userText = `Texto extraído de las Bases SEACE (PDF plano):
 ---

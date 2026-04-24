@@ -413,20 +413,23 @@ export async function runObraPipeline({
       if (debeLlm) {
         try {
           emit("llm", {
-            msg: `${p.nomenclatura} → Claude (${regexFallo ? "regex fallo" : regexSospechoso ? "sospecha" : "reforzar"})`,
+            msg: `${p.nomenclatura} → Claude (${regexFallo ? "regex fallo" : regexSospechoso ? "sospecha" : esTemplate ? "template" : "reforzar"})`,
           });
           const vr = detalle.vrCuantiaMonto || p.vrCuantia;
-          // preferir PDF directo si tenemos uno (Claude OCR-ea si hace falta)
-          const llm =
-            descarga.tipo === "pdf"
-              ? await extractRequisitosWithClaudePdf(descarga.buffer, {
-                  valorReferencial: vr,
-                  filename: descarga.filename,
-                })
-              : await extractRequisitosWithClaudeText(doc.text, { valorReferencial: vr });
+
+          // ESTRATEGIA: preferir TEXT (10× más barato en tokens).
+          // Solo usar PDF si no hay texto extraído bueno (ej. escaneado que NO pasó el
+          // filtro de escaneado antes, caso raro).
+          const textOk = doc.text && doc.text.length > 500;
+          const llm = textOk
+            ? await extractRequisitosWithClaudeText(doc.text, { valorReferencial: vr })
+            : await extractRequisitosWithClaudePdf(descarga.buffer, {
+                valorReferencial: vr,
+                filename: descarga.filename,
+              });
 
           analisis.llmUsed = {
-            via: descarga.tipo === "pdf" ? "pdf-native" : "text",
+            via: textOk ? "text" : "pdf-native",
             ...llm.meta,
             citas: llm.citas,
             notas: llm.notas,
