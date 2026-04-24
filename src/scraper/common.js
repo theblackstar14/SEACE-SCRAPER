@@ -322,6 +322,8 @@ export async function collectAllPages(page, { maxRows = Infinity, maxPages = 50 
 
 /**
  * Busca una fila específica en la página actual.
+ * Prioriza matching por nidProceso en onclick (robusto frente a diffs de texto).
+ * Fallback: compara nomenclatura normalizada.
  * Si no está, intenta paginar hasta encontrar.
  */
 export async function findRow(page, { nomenclatura, nidProceso, maxPages = 20 }) {
@@ -331,17 +333,21 @@ export async function findRow(page, { nomenclatura, nidProceso, maxPages = 20 })
         const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
         const rows = document.querySelectorAll(sel);
         for (const r of rows) {
-          const cells = r.querySelectorAll("td");
-          // nomenclatura está en col idx 3 (según thead observado)
-          if (nom && cells[3] && norm(cells[3].innerText) === norm(nom)) return r;
+          // 1. match por nidProceso en CUALQUIER onclick de la fila (más robusto)
           if (nid) {
-            // buscar onclick con nidProceso en el link de ficha
-            const fichaLink = r.querySelector("a:has(img[src*='fichaSeleccion'])") ||
-                              [...r.querySelectorAll("a[onclick]")].find((a) =>
-                                (a.getAttribute("onclick") || "").includes(`'nidProceso':'${nid}'`)
-                              );
-            if (fichaLink && (fichaLink.getAttribute("onclick") || "").includes(`'nidProceso':'${nid}'`)) {
-              return r;
+            const links = r.querySelectorAll("a[onclick]");
+            for (const a of links) {
+              const oc = a.getAttribute("onclick") || "";
+              if (oc.includes(`'nidProceso':'${nid}'`)) {
+                return r;
+              }
+            }
+          }
+          // 2. fallback: nomenclatura en cualquier <td>
+          if (nom) {
+            const cells = r.querySelectorAll("td");
+            for (const c of cells) {
+              if (norm(c.innerText) === norm(nom)) return r;
             }
           }
         }
@@ -451,12 +457,18 @@ export async function navigateToFichaViaBuscador(page, { nomenclatura, nidProces
 }
 
 /**
- * Flow smart: si hay nidConvocatoria usa directo; si no, fallback a buscador.
+ * Flow actual: SIEMPRE via buscador.
+ *
+ * El "direct nav" via PrimeFaces.addSubmitParam está ROTO por diseño JSF:
+ * el componente que dispara la acción (`:rowIdx:btnId`) debe existir en el
+ * ViewState del servidor, y solo existe si la tabla ya fue renderizada con
+ * esa fila específica. No hay atajo confiable.
+ *
+ * Con el datepicker ahora funcional y filtros aplicándose bien, via-buscador
+ * es rápido: la fila target casi siempre está en página 1-2 del listado
+ * filtrado. findRow por nidProceso match es O(1) en la página actual.
  */
 export async function navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters }) {
-  if (nidProceso && nidConvocatoria) {
-    return navigateToFichaDirect(page, { nidProceso, nidConvocatoria });
-  }
   return navigateToFichaViaBuscador(page, { nomenclatura, nidProceso, filters });
 }
 
