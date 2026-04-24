@@ -206,12 +206,40 @@ export async function runObraPipeline({
         if (dumpFile) analisis.warnings.push(`dump: ${dumpFile}`);
       }
 
+      // sanity check: si monto extraído ≈ VR, probable confusión
+      const vr = detalle.vrCuantiaMonto || p.vrCuantia;
+      let sospecha = null;
+      if (requisitos.experienciaMonto && vr) {
+        const diff = Math.abs(requisitos.experienciaMonto - vr) / vr;
+        if (diff < 0.02) {
+          sospecha = `monto extraído (${requisitos.experienciaMonto}) coincide con VR (${vr}) ±2% — probable falso positivo`;
+          analisis.warnings.push(`sospecha: ${sospecha}`);
+          // dump para auditoría
+          const dumpFile = await dumpText(p.nomenclatura, doc.text, {
+            source: doc.source,
+            ...doc.meta,
+          });
+          if (dumpFile) analisis.warnings.push(`dump-sospecha: ${dumpFile}`);
+        }
+      }
+
       analisis.requisitos = {
         experienciaMonto: requisitos.experienciaMonto,
-        experienciaConfianza: requisitos.experienciaConfianza,
+        experienciaConfianza: sospecha ? Math.min(requisitos.experienciaConfianza, 0.3) : requisitos.experienciaConfianza,
+        experienciaHits: requisitos.experienciaHits.map((h) => ({
+          tipo: h.tipo,
+          monto: h.monto,
+          veces: h.veces,
+          cantidad: h.cantidad,
+          unidad: h.unidad,
+          patternId: h.patternId,
+          confianza: h.confianza,
+          fragmento: h.fragmento,
+        })),
         tipoObra: requisitos.tiposObraSimilar.join("|"),
         antiguedadMaxAnios: requisitos.antiguedadMaxAnios,
-        requiereLlm: requisitos.requiereLlm,
+        requiereLlm: requisitos.requiereLlm || sospecha != null,
+        sospecha,
         paginas: doc.meta?.pages || null,
         fuente: doc.source,
       };
@@ -221,6 +249,11 @@ export async function runObraPipeline({
         analisis.evaluacion = {
           resultado: "indeterminado",
           razones: [analisis.calidadTexto.razonCalidad],
+        };
+      } else if (sospecha) {
+        analisis.evaluacion = {
+          resultado: "indeterminado",
+          razones: [`Requiere revisión manual: ${sospecha}`],
         };
       } else {
         analisis.evaluacion = evaluarProceso(requisitos, empresa, { consorcioRatio: 0.5 });
