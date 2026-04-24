@@ -8,6 +8,11 @@ import { extractTextFromDoc } from "../pdf/docExtractor.js";
 import { analizarRequisitos } from "../analyzer/requisitos.js";
 import { evaluarProceso } from "../analyzer/evaluator.js";
 import { cleanDownloadsDir } from "../browserPool.js";
+import { isLlmAvailable } from "../llm/claude.js";
+import {
+  extractRequisitosWithClaudePdf,
+  extractRequisitosWithClaudeText,
+} from "../analyzer/llmExtractor.js";
 
 const DEBUG_DIR = "./data/debug/pdftext";
 const DUMP_MAX_FILES = 20;
@@ -40,6 +45,30 @@ async function dumpText(nomenclatura, text, meta) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Convierte output del LLM al formato interno de requisitos para compatibilidad
+ * con el resto del pipeline.
+ */
+function mapLlmToRequisitos(llm, { fuente = "claude" } = {}) {
+  return {
+    experienciaMonto: llm.experienciaMonto,
+    experienciaConfianza: llm.confianza,
+    experienciaHits: llm.citas.map((c, i) => ({
+      tipo: "monto",
+      monto: llm.experienciaMonto,
+      patternId: `LLM-${i + 1}`,
+      confianza: llm.confianza,
+      fragmento: c,
+    })),
+    tipoObra: (llm.tiposObraSimilar || []).join("|"),
+    antiguedadMaxAnios: llm.antiguedadMaxAnios,
+    requiereLlm: false, // ya lo usamos
+    sospecha: null,
+    paginas: llm.meta?.pagesAnalyzed || null,
+    fuente,
+  };
 }
 
 /**
@@ -91,6 +120,8 @@ export async function runObraPipeline({
   concurrency = 2,
   onProgress = () => {},
   skipPdf = false,
+  useLlm = isLlmAvailable(), // auto si ANTHROPIC_API_KEY está en env
+  llmPolicy = "fallback", // 'fallback' = solo si regex falla | 'always' = siempre
 } = {}) {
   const runStart = Date.now();
   const emit = (step, data) => {
@@ -202,6 +233,45 @@ export async function runObraPipeline({
       analisis.calidadTexto = analizarCalidadTexto(doc.text, doc.meta || {});
       analisis.textoExtraido = doc.text.length > 100;
 
+      analisis.zipContents = doc.meta?.allEntries || null;
+
+      // CASO ESPECIAL: escaneado Y Claude disponible → fallback LLM directo sobre el PDF
+      if (analisis.calidadTexto.escaneado && useLlm && descarga.tipo === "pdf") {
+        try {
+          emit("llm", { msg: `${p.nomenclatura} → Claude OCR (escaneado)` });
+          const vr = detalle.vrCuantiaMonto || p.vrCuantia;
+          const llm = await extractRequisitosWithClaudePdf(descarga.buffer, {
+            valorReferencial: vr,
+            filename: descarga.filename,
+          });
+          analisis.requisitos = mapLlmToRequisitos(llm, { fuente: `claude-pdf-ocr` });
+          analisis.llmUsed = { via: "pdf-ocr", ...llm.meta };
+          if (!llm.esBasesIntegradas || llm.confianza < 0.3 || llm.experienciaMonto == null) {
+            analisis.evaluacion = {
+              resultado: "indeterminado",
+              razones: [
+                llm.esBasesIntegradas
+                  ? `Claude analizó el PDF pero no detectó monto específico de experiencia (confianza ${llm.confianza.toFixed(2)}). ${llm.notas || ""}`
+                  : `Claude identificó Bases Estándar sin rellenar (etapa temprana). ${llm.notas || ""}`,
+              ],
+            };
+          } else {
+            analisis.evaluacion = evaluarProceso(
+              { experienciaMonto: llm.experienciaMonto, tiposObraSimilar: llm.tiposObraSimilar, antiguedadMaxAnios: llm.antiguedadMaxAnios },
+              empresa,
+              { consorcioRatio: 0.5 }
+            );
+            analisis.evaluacion.razones.unshift(
+              `Extracción por Claude (PDF escaneado, OCR): confianza ${llm.confianza.toFixed(2)}`
+            );
+          }
+          enriquecidos.push({ listado: p, detalle, analisis });
+          continue;
+        } catch (e) {
+          analisis.warnings.push(`claude OCR fail: ${e.message}`);
+        }
+      }
+
       if (!analisis.textoExtraido || analisis.calidadTexto.escaneado) {
         let razon;
         if (analisis.calidadTexto.escaneado) {
@@ -213,7 +283,6 @@ export async function runObraPipeline({
           razon = `No se pudo extraer texto del ${doc.source.toUpperCase()} (${descarga.filename})`;
         }
         analisis.evaluacion = { resultado: "indeterminado", razones: [razon] };
-        analisis.zipContents = doc.meta?.allEntries || null;
         enriquecidos.push({ listado: p, detalle, analisis });
         continue;
       }
@@ -269,13 +338,112 @@ export async function runObraPipeline({
         fuente: doc.source,
       };
 
-      // si es template sin montos, indicar razón clara
-      if (analisis.calidadTexto.template && requisitos.experienciaMonto == null) {
+      // decisión: regex suficiente, o llamar a Claude?
+      const regexFallo = requisitos.experienciaMonto == null;
+      const regexSospechoso = sospecha != null;
+      const esTemplateSinMonto = analisis.calidadTexto.template && regexFallo;
+      const debeLlm =
+        useLlm &&
+        (llmPolicy === "always" ||
+          regexFallo ||
+          regexSospechoso ||
+          esTemplateSinMonto ||
+          requisitos.experienciaConfianza < 0.7);
+
+      if (debeLlm) {
+        try {
+          emit("llm", {
+            msg: `${p.nomenclatura} → Claude (${regexFallo ? "regex fallo" : regexSospechoso ? "sospecha" : "reforzar"})`,
+          });
+          const vr = detalle.vrCuantiaMonto || p.vrCuantia;
+          // preferir PDF directo si tenemos uno (Claude OCR-ea si hace falta)
+          const llm =
+            descarga.tipo === "pdf"
+              ? await extractRequisitosWithClaudePdf(descarga.buffer, {
+                  valorReferencial: vr,
+                  filename: descarga.filename,
+                })
+              : await extractRequisitosWithClaudeText(doc.text, { valorReferencial: vr });
+
+          analisis.llmUsed = {
+            via: descarga.tipo === "pdf" ? "pdf-native" : "text",
+            ...llm.meta,
+            citas: llm.citas,
+            notas: llm.notas,
+          };
+
+          // LLM pisa regex si tiene mayor confianza o regex falló
+          if (llm.experienciaMonto != null && (regexFallo || llm.confianza > requisitos.experienciaConfianza)) {
+            analisis.requisitos = mapLlmToRequisitos(llm, {
+              fuente: `claude-${descarga.tipo === "pdf" ? "pdf" : "text"}`,
+            });
+
+            if (llm.esBasesIntegradas && llm.confianza >= 0.5) {
+              analisis.evaluacion = evaluarProceso(
+                {
+                  experienciaMonto: llm.experienciaMonto,
+                  tiposObraSimilar: llm.tiposObraSimilar,
+                  antiguedadMaxAnios: llm.antiguedadMaxAnios,
+                },
+                empresa,
+                { consorcioRatio: 0.5 }
+              );
+              analisis.evaluacion.razones.unshift(
+                `Extracción por Claude (confianza ${llm.confianza.toFixed(2)}, citas: ${llm.citas.length})`
+              );
+            } else {
+              analisis.evaluacion = {
+                resultado: "indeterminado",
+                razones: [
+                  llm.esBasesIntegradas
+                    ? `Claude: monto S/ ${llm.experienciaMonto?.toLocaleString("es-PE")} pero confianza baja (${llm.confianza.toFixed(2)}). ${llm.notas || ""}`
+                    : `Claude: Bases Estándar sin rellenar. ${llm.notas || ""}`,
+                ],
+              };
+            }
+          } else {
+            // LLM también falló — usar regex si extrajo algo con sospecha flag
+            if (esTemplateSinMonto) {
+              analisis.evaluacion = {
+                resultado: "indeterminado",
+                razones: [llm.notas || analisis.calidadTexto.razonCalidad],
+              };
+            } else if (regexSospechoso) {
+              analisis.evaluacion = {
+                resultado: "indeterminado",
+                razones: [`Requiere revisión manual: ${sospecha}. Claude tampoco confirmó el monto.`],
+              };
+            } else {
+              analisis.evaluacion = {
+                resultado: "indeterminado",
+                razones: [`Ni regex ni Claude encontraron requisitos extraíbles. ${llm.notas || ""}`],
+              };
+            }
+          }
+        } catch (e) {
+          console.warn(`[llm FAIL] ${p.nomenclatura}: ${e.message}`);
+          analisis.warnings.push(`claude error: ${e.message}`);
+          // fallback a lógica regex-only
+          if (esTemplateSinMonto) {
+            analisis.evaluacion = {
+              resultado: "indeterminado",
+              razones: [analisis.calidadTexto.razonCalidad],
+            };
+          } else if (regexSospechoso) {
+            analisis.evaluacion = {
+              resultado: "indeterminado",
+              razones: [`Requiere revisión manual: ${sospecha}`],
+            };
+          } else {
+            analisis.evaluacion = evaluarProceso(requisitos, empresa, { consorcioRatio: 0.5 });
+          }
+        }
+      } else if (esTemplateSinMonto) {
         analisis.evaluacion = {
           resultado: "indeterminado",
           razones: [analisis.calidadTexto.razonCalidad],
         };
-      } else if (sospecha) {
+      } else if (regexSospechoso) {
         analisis.evaluacion = {
           resultado: "indeterminado",
           razones: [`Requiere revisión manual: ${sospecha}`],
@@ -313,6 +481,7 @@ export async function runObraPipeline({
     documentoUsado: analisis.documentoUsado,
     zipContents: analisis.zipContents || null,
     calidadTexto: analisis.calidadTexto, // { escaneado, template, razonCalidad }
+    llmUsed: analisis.llmUsed || null,
     requisitos: analisis.requisitos
       ? {
           experienciaMinima: analisis.requisitos.experienciaMonto,
@@ -341,6 +510,8 @@ export async function runObraPipeline({
     indeterminados: procesos.filter((p) => p.evaluacion.resultado === "indeterminado").length,
     escaneados: procesos.filter((p) => p.calidadTexto?.escaneado).length,
     templates: procesos.filter((p) => p.calidadTexto?.template).length,
+    llmUsed: procesos.filter((p) => p.llmUsed).length,
+    llmEnabled: useLlm,
     duracionMs: Date.now() - runStart,
   };
 

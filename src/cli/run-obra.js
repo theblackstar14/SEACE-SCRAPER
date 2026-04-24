@@ -30,6 +30,8 @@ function parseArgs(argv) {
     else if (a === "--skip-pdf") args.skipPdf = true;
     else if (a === "--headed") args.headed = true;
     else if (a === "--slow-mo") args.slowMo = Number(next) || 250, i++;
+    else if (a === "--no-llm") args.noLlm = true;
+    else if (a === "--llm-always") args.llmAlways = true;
     else if (a === "--help" || a === "-h") {
       console.log(
         `Usage: node src/cli/run-obra.js [opts]\n` +
@@ -42,7 +44,9 @@ function parseArgs(argv) {
           `  --out DIR          carpeta de salida (default ./data/output)\n` +
           `  --skip-pdf         no descarga/analiza PDFs (rápido para debug)\n` +
           `  --headed           abre Chromium visible (debug visual)\n` +
-          `  --slow-mo N        delay en ms entre acciones (default 250 si --headed)\n`
+          `  --slow-mo N        delay en ms entre acciones (default 250 si --headed)\n` +
+          `  --no-llm           desactiva fallback Claude aunque haya ANTHROPIC_API_KEY\n` +
+          `  --llm-always       usa Claude para TODOS los procesos (no solo fallback)\n`
       );
       process.exit(0);
     }
@@ -71,11 +75,16 @@ async function main() {
   // cargar empresa
   const empresa = JSON.parse(await fs.readFile(args.empresa, "utf8"));
 
+  const llmDisponible = !!process.env.ANTHROPIC_API_KEY;
+  const useLlm = llmDisponible && !args.noLlm;
+  const llmPolicy = args.llmAlways ? "always" : "fallback";
+
   console.log(`\n🏗️  SEACE Obra Pipeline`);
   console.log(`   Empresa:  ${empresa.razonSocial} (RUC ${empresa.ruc})`);
   console.log(`   Rango:    ${fechaDesde} → ${fechaHasta}`);
   console.log(`   Límite:   ${args.limit} procesos`);
-  console.log(`   SkipPDF:  ${!!args.skipPdf}\n`);
+  console.log(`   SkipPDF:  ${!!args.skipPdf}`);
+  console.log(`   Claude:   ${useLlm ? `✨ ON (${llmPolicy})` : llmDisponible ? "off (--no-llm)" : "off (sin API key)"}\n`);
 
   const store = createJsonStore(args.out);
   const runId = store.newRunId();
@@ -92,6 +101,8 @@ async function main() {
       limit: args.limit,
       concurrency: args.concurrency || 2,
       skipPdf: !!args.skipPdf,
+      useLlm,
+      llmPolicy,
     });
 
     const file = await store.saveRun(runId, payload);
@@ -104,6 +115,11 @@ async function main() {
     console.log(`   Consorcio:       ${payload.resumen.consorcio}`);
     console.log(`   No califican:    ${payload.resumen.noCalifican}`);
     console.log(`   Indeterminados:  ${payload.resumen.indeterminados}`);
+    console.log(`   Escaneados:      ${payload.resumen.escaneados}`);
+    console.log(`   Templates:       ${payload.resumen.templates}`);
+    if (payload.resumen.llmEnabled) {
+      console.log(`   ✨ Claude:        ${payload.resumen.llmUsed} procesos analizados`);
+    }
     console.log(`   Duración:        ${(payload.resumen.duracionMs / 1000).toFixed(1)}s`);
   } finally {
     await shutdownBrowser();
