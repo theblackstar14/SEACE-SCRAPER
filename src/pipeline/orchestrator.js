@@ -1,13 +1,29 @@
 import pLimit from "p-limit";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { scrapeSeace } from "../scraper/seaceScraper.js";
 import { scrapeDetalle } from "../scraper/seaceDetalle.js";
 import { isProcesoActivo } from "../scraper/cronograma.js";
 import { selectBasesIntegradas } from "../scraper/documentos.js";
 import { downloadDocumento } from "../pdf/downloader.js";
-import { normalizeToPdfs } from "../pdf/zipExtractor.js";
-import { extractTextFromMany } from "../pdf/textExtractor.js";
+import { extractTextFromDoc } from "../pdf/docExtractor.js";
 import { analizarRequisitos } from "../analyzer/requisitos.js";
 import { evaluarProceso } from "../analyzer/evaluator.js";
+
+const DEBUG_DIR = "./data/debug/pdftext";
+
+async function dumpText(nomenclatura, text, meta) {
+  try {
+    await fs.mkdir(DEBUG_DIR, { recursive: true });
+    const safe = nomenclatura.replace(/[^\w-]/g, "_").slice(0, 80);
+    const file = path.join(DEBUG_DIR, `${safe}.txt`);
+    const header = `// Nomenclatura: ${nomenclatura}\n// Source: ${meta.source}\n// Files: ${JSON.stringify(meta.files || [])}\n// Pages: ${meta.pages || "n/a"}\n// Length: ${text.length} chars\n\n`;
+    await fs.writeFile(file, header + text, "utf8");
+    return file;
+  } catch (e) {
+    return null;
+  }
+}
 
 /**
  * Pipeline:
@@ -139,32 +155,37 @@ export async function runObraPipeline({
             },
           });
 
-          const pdfs = normalizeToPdfs(descarga);
-          if (!pdfs.length) {
-            analisis.warnings.push(
-              `Archivo ${descarga.tipo} no rindió PDFs (${descarga.filename})`
-            );
+          const doc = await extractTextFromDoc(descarga);
+          analisis.textoExtraido = doc.text.length > 100;
+          if (doc.errors.length) analisis.warnings.push(...doc.errors.map((e) => `${e.name}: ${e.error}`));
+
+          if (!analisis.textoExtraido) {
             analisis.evaluacion = {
               resultado: "indeterminado",
-              razones: [`Archivo ${descarga.tipo.toUpperCase()} no soportado o sin PDFs dentro.`],
+              razones: [
+                `No se pudo extraer texto del ${doc.source.toUpperCase()} (${descarga.filename})`,
+              ],
             };
             return { listado: p, detalle, analisis };
           }
 
-          const { text, totalPages, errors } = await extractTextFromMany(pdfs);
-          analisis.textoExtraido = true;
-          if (errors.length) analisis.warnings.push(...errors.map((e) => `PDF ${e.name}: ${e.error}`));
-
-          const requisitos = analizarRequisitos(text, {
+          const requisitos = analizarRequisitos(doc.text, {
             valorReferencial: detalle.vrCuantiaMonto || p.vrCuantia,
           });
+
+          // dump texto cuando regex no encuentra monto — para calibrar
+          if (requisitos.experienciaMonto == null) {
+            const dumpFile = await dumpText(p.nomenclatura, doc.text, doc.meta);
+            if (dumpFile) analisis.warnings.push(`dump: ${dumpFile}`);
+          }
           analisis.requisitos = {
             experienciaMonto: requisitos.experienciaMonto,
             experienciaConfianza: requisitos.experienciaConfianza,
             tipoObra: requisitos.tiposObraSimilar.join("|"),
             antiguedadMaxAnios: requisitos.antiguedadMaxAnios,
             requiereLlm: requisitos.requiereLlm,
-            paginas: totalPages,
+            paginas: doc.meta?.pages || null,
+            fuente: doc.source,
           };
 
           const evaluacion = evaluarProceso(requisitos, empresa, { consorcioRatio: 0.5 });
