@@ -1,6 +1,29 @@
 import { chromium } from "playwright";
 import pLimit from "p-limit";
+import path from "node:path";
+import fs from "node:fs";
 import { config } from "./config/config.js";
+
+// folder controlado para downloads de Playwright (evita llenar %TEMP%)
+const DOWNLOADS_DIR = path.resolve("./data/tmp/downloads");
+
+export function ensureDownloadsDir() {
+  try {
+    fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+  } catch {}
+  return DOWNLOADS_DIR;
+}
+
+export function cleanDownloadsDir() {
+  try {
+    if (!fs.existsSync(DOWNLOADS_DIR)) return;
+    for (const entry of fs.readdirSync(DOWNLOADS_DIR)) {
+      try {
+        fs.rmSync(path.join(DOWNLOADS_DIR, entry), { recursive: true, force: true });
+      } catch {}
+    }
+  } catch {}
+}
 
 let browser = null;
 let launching = null;
@@ -30,6 +53,7 @@ async function getBrowser() {
 
   const launchOpts = {
     headless: config.headless,
+    downloadsPath: ensureDownloadsDir(), // controla dónde van descargas (no %TEMP%)
     args: [
       "--disable-dev-shm-usage",
       "--no-sandbox",
@@ -70,6 +94,10 @@ async function newContext(b) {
     viewport: { width: 1366, height: 900 },
     locale: "es-PE",
     timezoneId: "America/Lima",
+    acceptDownloads: true,
+    // NO recording — previene trace/video archivos temp inflados
+    recordVideo: undefined,
+    recordHar: undefined,
   });
 
   // stealth básico

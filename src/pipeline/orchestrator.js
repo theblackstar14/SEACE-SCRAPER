@@ -7,12 +7,31 @@ import { isProcesoActivo } from "../scraper/cronograma.js";
 import { extractTextFromDoc } from "../pdf/docExtractor.js";
 import { analizarRequisitos } from "../analyzer/requisitos.js";
 import { evaluarProceso } from "../analyzer/evaluator.js";
+import { cleanDownloadsDir } from "../browserPool.js";
 
 const DEBUG_DIR = "./data/debug/pdftext";
+const DUMP_MAX_FILES = 20;
 
 async function dumpText(nomenclatura, text, meta) {
   try {
     await fs.mkdir(DEBUG_DIR, { recursive: true });
+
+    // rotación: si ya hay más de N archivos, borrar los más viejos
+    try {
+      const entries = await fs.readdir(DEBUG_DIR);
+      if (entries.length >= DUMP_MAX_FILES) {
+        const stats = await Promise.all(
+          entries.map(async (e) => ({
+            name: e,
+            mtime: (await fs.stat(path.join(DEBUG_DIR, e))).mtimeMs,
+          }))
+        );
+        stats.sort((a, b) => a.mtime - b.mtime);
+        const toDelete = stats.slice(0, Math.max(0, entries.length - DUMP_MAX_FILES + 1));
+        await Promise.all(toDelete.map((e) => fs.rm(path.join(DEBUG_DIR, e.name), { force: true })));
+      }
+    } catch {}
+
     const safe = nomenclatura.replace(/[^\w-]/g, "_").slice(0, 80);
     const file = path.join(DEBUG_DIR, `${safe}.txt`);
     const header = `// Nomenclatura: ${nomenclatura}\n// Source: ${meta.source || "?"}\n// Files: ${JSON.stringify(meta.files || [])}\n// Pages: ${meta.pages || "n/a"}\n// Length: ${text.length} chars\n\n`;
@@ -79,6 +98,9 @@ export async function runObraPipeline({
     const log = `[${step}] ${data.msg || ""}`;
     console.log(log);
   };
+
+  // 0. CLEANUP de runs previos (evita que descargas acumuladas llenen disco)
+  cleanDownloadsDir();
 
   // 1. LISTADO
   emit("listado", { msg: `scraping listado con filtros ${JSON.stringify(filters)}` });
@@ -317,6 +339,9 @@ export async function runObraPipeline({
     templates: procesos.filter((p) => p.calidadTexto?.template).length,
     duracionMs: Date.now() - runStart,
   };
+
+  // cleanup final: temps de descarga ya no se necesitan
+  cleanDownloadsDir();
 
   emit("done", { msg: JSON.stringify(resumen) });
 

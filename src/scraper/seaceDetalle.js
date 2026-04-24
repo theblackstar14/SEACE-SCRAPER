@@ -182,6 +182,7 @@ async function parseFichaFromPage(page, { nomenclatura, nidProceso } = {}) {
 
 /**
  * Descarga un documento específico de la ficha ya abierta (sin re-navegar).
+ * Limpia el archivo temp de Playwright tras leer el buffer (evita llenar %TEMP%).
  */
 async function downloadFromPage(page, filename) {
   const dlAnchor = await page.evaluateHandle((fname) => {
@@ -204,6 +205,10 @@ async function downloadFromPage(page, filename) {
   const chunks = [];
   for await (const c of stream) chunks.push(c);
   const buffer = Buffer.concat(chunks);
+
+  // limpiar temp de Playwright — evita saturar %TEMP% en runs largos
+  await download.delete().catch(() => {});
+
   return {
     filename: download.suggestedFilename() || filename,
     buffer,
