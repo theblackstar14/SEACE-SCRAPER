@@ -10,6 +10,8 @@ import { extractText, extractTextFromMany } from "./textExtractor.js";
 import { extractPdfsFromZip } from "./zipExtractor.js";
 import mammoth from "mammoth";
 
+const MAX_ZIP_DEPTH = 3; // evita loops / zip bombs
+
 /**
  * Extrae texto de un archivo docx vía mammoth (no trae formato, solo texto plano).
  */
@@ -18,6 +20,93 @@ async function extractTextFromDocx(buffer) {
   return {
     text: result.value || "",
     messages: result.messages || [],
+  };
+}
+
+/**
+ * Extrae texto de un ZIP con soporte recursivo (ZIPs anidados — común en SEACE).
+ * SEACE a veces empaca "Bases+Administrativas.zip" que contiene adentro
+ * "BASES+INTEGRADAS.zip" → tenemos que recursar.
+ */
+async function extractFromZipBuffer(buffer, { filename = "archive.zip", errors = [], depth = 0, prefix = "" } = {}) {
+  if (depth >= MAX_ZIP_DEPTH) {
+    errors.push({ name: filename, error: `ZIP depth > ${MAX_ZIP_DEPTH}, stop recursion` });
+    return { text: "", source: "zip", errors, meta: { pages: 0, files: [], allEntries: [] } };
+  }
+
+  const entries = extractPdfsFromZip(buffer, { includeAll: true });
+
+  const allEntries = entries.map((e) => ({
+    name: (prefix ? `${prefix}/` : "") + e.name,
+    size: e.size,
+    ext: (e.name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase(),
+  }));
+
+  const parts = [];
+  const files = [];
+  let totalPages = 0;
+
+  for (const entry of entries) {
+    const entryName = (prefix ? `${prefix}/` : "") + entry.name;
+    const innerExt = (entry.name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+    try {
+      if (innerExt === "pdf") {
+        const { text, numPages } = await extractText(entry.buffer);
+        parts.push(`\n\n--- FILE: ${entryName} (pdf, ${numPages}p) ---\n${text}`);
+        totalPages += numPages;
+        files.push(entryName);
+      } else if (innerExt === "docx") {
+        const { text } = await extractTextFromDocx(entry.buffer);
+        parts.push(`\n\n--- FILE: ${entryName} (docx) ---\n${text}`);
+        files.push(entryName);
+      } else if (innerExt === "zip") {
+        // RECURSIVO — ZIPs anidados
+        console.log(`[zip] recursando en ${entryName} (depth ${depth + 1})`);
+        const nested = await extractFromZipBuffer(entry.buffer, {
+          filename: entry.name,
+          errors,
+          depth: depth + 1,
+          prefix: entryName,
+        });
+        if (nested.text) {
+          parts.push(nested.text);
+          totalPages += nested.meta?.pages || 0;
+          files.push(...(nested.meta?.files || []));
+          // merge inner entries en allEntries (para debug completo)
+          if (nested.meta?.allEntries) {
+            allEntries.push(...nested.meta.allEntries);
+          }
+        }
+      } else if (innerExt === "doc") {
+        errors.push({
+          name: entryName,
+          error: ".doc (Word 97-2003) requiere conversión previa — no soportado",
+        });
+      }
+      // xls, dwg, jpg, png ignorados (no texto)
+    } catch (e) {
+      errors.push({ name: entryName, error: e.message });
+    }
+  }
+
+  if (parts.join("").length < 100 && allEntries.length > 0 && depth === 0) {
+    console.warn(
+      `[zip] ${filename} no rindió texto. Contenido (${allEntries.length} entries):`,
+      allEntries.slice(0, 20).map((e) => `${e.name} (${(e.size / 1024).toFixed(0)}KB)`).join(", ")
+    );
+  }
+
+  return {
+    text: parts.join(""),
+    source: "zip",
+    errors,
+    meta: {
+      pages: totalPages,
+      files,
+      entriesInZip: entries.length,
+      allEntries: allEntries.slice(0, 50),
+      recursedDepth: depth,
+    },
   };
 }
 
@@ -61,65 +150,7 @@ export async function extractTextFromDoc({ filename, buffer, tipo }) {
   }
 
   if (ext === "zip") {
-    // extrae todo el contenido del zip (pdfs + docx + más)
-    const entries = extractPdfsFromZip(buffer, { includeAll: true });
-
-    // listado detallado de TODO lo que hay en el ZIP (para debug)
-    const allEntries = entries.map((e) => ({
-      name: e.name,
-      size: e.size,
-      ext: (e.name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase(),
-    }));
-
-    // procesa cada archivo interno
-    const parts = [];
-    const files = [];
-    let totalPages = 0;
-
-    for (const entry of entries) {
-      const innerExt = (entry.name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
-      try {
-        if (innerExt === "pdf") {
-          const { text, numPages } = await extractText(entry.buffer);
-          parts.push(`\n\n--- FILE: ${entry.name} (pdf, ${numPages}p) ---\n${text}`);
-          totalPages += numPages;
-          files.push(entry.name);
-        } else if (innerExt === "docx") {
-          const { text } = await extractTextFromDocx(entry.buffer);
-          parts.push(`\n\n--- FILE: ${entry.name} (docx) ---\n${text}`);
-          files.push(entry.name);
-        } else if (innerExt === "doc") {
-          // .doc (Word 97-2003) NO soportado por mammoth — flaguear
-          errors.push({
-            name: entry.name,
-            error: ".doc (Word 97-2003) requiere conversion previa — no soportado",
-          });
-        }
-        // otros tipos (xls, dwg, jpg, png...) no aportan texto
-      } catch (e) {
-        errors.push({ name: entry.name, error: e.message });
-      }
-    }
-
-    // si nada rindió texto, loggear el contenido para diagnóstico
-    if (parts.join("").length < 100 && allEntries.length > 0) {
-      console.warn(
-        `[zip] ${filename} no rindió texto. Contenido (${allEntries.length} entries):`,
-        allEntries.slice(0, 20).map((e) => `${e.name} (${(e.size / 1024).toFixed(0)}KB)`).join(", ")
-      );
-    }
-
-    return {
-      text: parts.join(""),
-      source: "zip",
-      errors,
-      meta: {
-        pages: totalPages,
-        files,
-        entriesInZip: entries.length,
-        allEntries: allEntries.slice(0, 30), // incluye primeros 30 en meta
-      },
-    };
+    return extractFromZipBuffer(buffer, { filename, errors, depth: 0 });
   }
 
   if (ext === "rar") {
