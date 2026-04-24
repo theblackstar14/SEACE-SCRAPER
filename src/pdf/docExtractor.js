@@ -63,6 +63,14 @@ export async function extractTextFromDoc({ filename, buffer, tipo }) {
   if (ext === "zip") {
     // extrae todo el contenido del zip (pdfs + docx + más)
     const entries = extractPdfsFromZip(buffer, { includeAll: true });
+
+    // listado detallado de TODO lo que hay en el ZIP (para debug)
+    const allEntries = entries.map((e) => ({
+      name: e.name,
+      size: e.size,
+      ext: (e.name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase(),
+    }));
+
     // procesa cada archivo interno
     const parts = [];
     const files = [];
@@ -80,18 +88,37 @@ export async function extractTextFromDoc({ filename, buffer, tipo }) {
           const { text } = await extractTextFromDocx(entry.buffer);
           parts.push(`\n\n--- FILE: ${entry.name} (docx) ---\n${text}`);
           files.push(entry.name);
+        } else if (innerExt === "doc") {
+          // .doc (Word 97-2003) NO soportado por mammoth — flaguear
+          errors.push({
+            name: entry.name,
+            error: ".doc (Word 97-2003) requiere conversion previa — no soportado",
+          });
         }
-        // otros tipos (xls, dwg, jpg...) ignorados para extracción de texto
+        // otros tipos (xls, dwg, jpg, png...) no aportan texto
       } catch (e) {
         errors.push({ name: entry.name, error: e.message });
       }
+    }
+
+    // si nada rindió texto, loggear el contenido para diagnóstico
+    if (parts.join("").length < 100 && allEntries.length > 0) {
+      console.warn(
+        `[zip] ${filename} no rindió texto. Contenido (${allEntries.length} entries):`,
+        allEntries.slice(0, 20).map((e) => `${e.name} (${(e.size / 1024).toFixed(0)}KB)`).join(", ")
+      );
     }
 
     return {
       text: parts.join(""),
       source: "zip",
       errors,
-      meta: { pages: totalPages, files, entriesInZip: entries.length },
+      meta: {
+        pages: totalPages,
+        files,
+        entriesInZip: entries.length,
+        allEntries: allEntries.slice(0, 30), // incluye primeros 30 en meta
+      },
     };
   }
 

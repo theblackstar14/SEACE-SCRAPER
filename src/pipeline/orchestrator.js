@@ -203,14 +203,17 @@ export async function runObraPipeline({
       analisis.textoExtraido = doc.text.length > 100;
 
       if (!analisis.textoExtraido || analisis.calidadTexto.escaneado) {
-        analisis.evaluacion = {
-          resultado: "indeterminado",
-          razones: [
-            analisis.calidadTexto.escaneado
-              ? analisis.calidadTexto.razonCalidad
-              : `No se pudo extraer texto del ${doc.source.toUpperCase()} (${descarga.filename})`,
-          ],
-        };
+        let razon;
+        if (analisis.calidadTexto.escaneado) {
+          razon = analisis.calidadTexto.razonCalidad;
+        } else if (doc.source === "zip" && doc.meta?.allEntries?.length) {
+          const list = doc.meta.allEntries.map((e) => `${e.name} (${Math.round(e.size / 1024)}KB)`).join(", ");
+          razon = `ZIP contiene ${doc.meta.allEntries.length} archivos sin texto extraíble: ${list}`;
+        } else {
+          razon = `No se pudo extraer texto del ${doc.source.toUpperCase()} (${descarga.filename})`;
+        }
+        analisis.evaluacion = { resultado: "indeterminado", razones: [razon] };
+        analisis.zipContents = doc.meta?.allEntries || null;
         enriquecidos.push({ listado: p, detalle, analisis });
         continue;
       }
@@ -308,6 +311,7 @@ export async function runObraPipeline({
     estado: detalle.fechaPresentacion?.estado,
     cronograma: detalle.cronograma,
     documentoUsado: analisis.documentoUsado,
+    zipContents: analisis.zipContents || null,
     calidadTexto: analisis.calidadTexto, // { escaneado, template, razonCalidad }
     requisitos: analisis.requisitos
       ? {
