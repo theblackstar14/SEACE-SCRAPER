@@ -48,6 +48,53 @@ async function dumpText(nomenclatura, text, meta) {
 }
 
 /**
+ * Busca el PDF más grande dentro de un ZIP (recursivo a ZIPs anidados).
+ * Retorna el Buffer o null.
+ */
+async function findLargestPdfRecursive(zip, depth = 0) {
+  if (depth > 3) return null;
+  const AdmZip = (await import("adm-zip")).default;
+  const entries = zip.getEntries().filter((e) => !e.isDirectory);
+
+  let biggest = null;
+  for (const e of entries) {
+    const ext = (e.entryName.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+    if (ext === "pdf") {
+      if (!biggest || e.header.size > biggest.header.size) {
+        biggest = e;
+      }
+    } else if (ext === "zip") {
+      try {
+        const inner = new AdmZip(e.getData());
+        const innerPdf = await findLargestPdfRecursive(inner, depth + 1);
+        if (innerPdf && (!biggest || innerPdf.length > (biggest.getData?.()?.length || 0))) {
+          return innerPdf; // ya es Buffer
+        }
+      } catch {}
+    }
+  }
+  return biggest ? biggest.getData() : null;
+}
+
+/**
+ * Sanity check: detecta si el monto extraído es absurdo vs VR.
+ * Ej: monto muy bajo (< 1% VR) o muy alto (> 20× VR) es probable error.
+ */
+function detectarMontoAbsurdo(monto, vr) {
+  if (!monto || !vr) return null;
+  if (monto === vr || Math.abs(monto - vr) / vr < 0.02) {
+    return `monto extraído (${monto}) coincide con VR (${vr}) ±2% — probable falso positivo`;
+  }
+  if (monto < vr * 0.01) {
+    return `monto extraído (S/ ${monto.toLocaleString("es-PE")}) es menor al 1% del VR (S/ ${vr.toLocaleString("es-PE")}) — monto absurdamente bajo`;
+  }
+  if (monto > vr * 20) {
+    return `monto extraído (S/ ${monto.toLocaleString("es-PE")}) es mayor a 20× VR (S/ ${vr.toLocaleString("es-PE")}) — monto absurdamente alto`;
+  }
+  return null;
+}
+
+/**
  * Convierte output del LLM al formato interno de requisitos para compatibilidad
  * con el resto del pipeline.
  */
@@ -235,12 +282,29 @@ export async function runObraPipeline({
 
       analisis.zipContents = doc.meta?.allEntries || null;
 
+      // si es ZIP escaneado (PDF dentro escaneado), extrae ese PDF para Claude OCR
+      let pdfForOcr = null;
+      if (analisis.calidadTexto.escaneado && useLlm) {
+        if (descarga.tipo === "pdf") {
+          pdfForOcr = descarga.buffer;
+        } else if (descarga.tipo === "zip") {
+          // extraer el PDF más grande del ZIP (recursivo si está anidado)
+          try {
+            const AdmZip = (await import("adm-zip")).default;
+            const zip = new AdmZip(descarga.buffer);
+            pdfForOcr = await findLargestPdfRecursive(zip);
+          } catch (e) {
+            analisis.warnings.push(`no pude extraer PDF del zip: ${e.message}`);
+          }
+        }
+      }
+
       // CASO ESPECIAL: escaneado Y Claude disponible → fallback LLM directo sobre el PDF
-      if (analisis.calidadTexto.escaneado && useLlm && descarga.tipo === "pdf") {
+      if (analisis.calidadTexto.escaneado && useLlm && pdfForOcr) {
         try {
           emit("llm", { msg: `${p.nomenclatura} → Claude OCR (escaneado)` });
           const vr = detalle.vrCuantiaMonto || p.vrCuantia;
-          const llm = await extractRequisitosWithClaudePdf(descarga.buffer, {
+          const llm = await extractRequisitosWithClaudePdf(pdfForOcr, {
             valorReferencial: vr,
             filename: descarga.filename,
           });
@@ -300,21 +364,16 @@ export async function runObraPipeline({
         if (dumpFile) analisis.warnings.push(`dump: ${dumpFile}`);
       }
 
-      // sanity check: si monto extraído ≈ VR, probable confusión
+      // sanity check ampliado: monto ≈ VR, < 1% VR, o > 20× VR → sospechoso
       const vr = detalle.vrCuantiaMonto || p.vrCuantia;
-      let sospecha = null;
-      if (requisitos.experienciaMonto && vr) {
-        const diff = Math.abs(requisitos.experienciaMonto - vr) / vr;
-        if (diff < 0.02) {
-          sospecha = `monto extraído (${requisitos.experienciaMonto}) coincide con VR (${vr}) ±2% — probable falso positivo`;
-          analisis.warnings.push(`sospecha: ${sospecha}`);
-          // dump para auditoría
-          const dumpFile = await dumpText(p.nomenclatura, doc.text, {
-            source: doc.source,
-            ...doc.meta,
-          });
-          if (dumpFile) analisis.warnings.push(`dump-sospecha: ${dumpFile}`);
-        }
+      let sospecha = detectarMontoAbsurdo(requisitos.experienciaMonto, vr);
+      if (sospecha) {
+        analisis.warnings.push(`sospecha: ${sospecha}`);
+        const dumpFile = await dumpText(p.nomenclatura, doc.text, {
+          source: doc.source,
+          ...doc.meta,
+        });
+        if (dumpFile) analisis.warnings.push(`dump-sospecha: ${dumpFile}`);
       }
 
       analisis.requisitos = {
@@ -341,13 +400,14 @@ export async function runObraPipeline({
       // decisión: regex suficiente, o llamar a Claude?
       const regexFallo = requisitos.experienciaMonto == null;
       const regexSospechoso = sospecha != null;
-      const esTemplateSinMonto = analisis.calidadTexto.template && regexFallo;
+      const esTemplate = analisis.calidadTexto.template; // template con o sin monto
+      const esTemplateSinMonto = esTemplate && regexFallo;
       const debeLlm =
         useLlm &&
         (llmPolicy === "always" ||
           regexFallo ||
           regexSospechoso ||
-          esTemplateSinMonto ||
+          esTemplate || // SIEMPRE Claude en templates (regex puede extraer basura)
           requisitos.experienciaConfianza < 0.7);
 
       if (debeLlm) {
