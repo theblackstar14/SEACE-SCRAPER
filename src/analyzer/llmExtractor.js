@@ -1,17 +1,16 @@
 /**
- * Extractor de requisitos SEACE con Claude (Haiku vision).
+ * Extractor de requisitos SEACE con LLM (Claude Haiku o Gemini Flash).
  *
- * Usado como fallback cuando:
- *  - PDF es escaneado (regex no funciona)
- *  - Regex extrajo monto sospechoso (ej: igual al VR)
- *  - Texto es muy corto o template sin montos
+ * Estrategia dual:
+ *  - Claude: rápido, bueno para texto extraído, context 200k
+ *  - Gemini: context 1M, excelente OCR, 10× más barato input tokens,
+ *    ideal para PDFs escaneados grandes que no caben en Claude
  *
- * Ventaja: Claude tiene OCR interno en document blocks → funciona sobre
- * PDFs escaneados sin tesseract. También razona sobre el texto para
- * distinguir experiencia mínima vs VR vs otros montos.
+ * El orchestrator decide cuál usar según tamaño/tipo del documento.
  */
 
 import { createMessage, extractToolInput, isLlmAvailable, defaultModel } from "../llm/claude.js";
+import { generateStructured, isGeminiAvailable, defaultGeminiModel } from "../llm/gemini.js";
 import { truncateForClaude } from "../pdf/pdfTruncate.js";
 
 /**
@@ -86,6 +85,10 @@ Claves importantes:
 
 Siempre responde invocando el tool registrar_requisitos_seace.`;
 
+// ============================================================================
+// CLAUDE
+// ============================================================================
+
 /**
  * Analiza un PDF con Claude — document block (OCR interno).
  */
@@ -94,20 +97,11 @@ export async function extractRequisitosWithClaudePdf(buffer, { valorReferencial 
     throw new Error("ANTHROPIC_API_KEY no configurada");
   }
 
-  // truncar si necesario (Claude limit ~32MB base64)
   const trunc = await truncateForClaude(buffer, { maxPages: 40 });
 
   const userText = `Analiza este documento de Bases SEACE y extrae los requisitos de calificación del postor.
-${
-  valorReferencial
-    ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")} (no confundir con la experiencia requerida).`
-    : ""
-}
-${
-  trunc.wasCropped
-    ? `\nNota: el documento original es grande (${Math.round(trunc.originalSize / 1024 / 1024)}MB, ${trunc.totalPages} páginas). Se te envían las primeras ${trunc.pagesIncluded} páginas. Los requisitos usualmente están al inicio del Capítulo "Requisitos de Calificación".`
-    : ""
-}
+${valorReferencial ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")} (no confundir con la experiencia requerida).` : ""}
+${trunc.wasCropped ? `\nNota: el documento original es grande (${Math.round(trunc.originalSize / 1024 / 1024)}MB, ${trunc.totalPages} páginas). Se te envían las primeras ${trunc.pagesIncluded} páginas.` : ""}
 
 Si es una Bases Estándar SIN rellenar (tiene placeholders [CONSIGNAR...]), indica es_bases_integradas=false y confianza≤0.3.
 Si son Bases Integradas con montos reales, extrae con precisión y confianza≥0.8.`;
@@ -129,7 +123,7 @@ Si son Bases Integradas con montos reales, extrae con precisión y confianza≥0
               media_type: "application/pdf",
               data: trunc.buffer.toString("base64"),
             },
-            cache_control: { type: "ephemeral" }, // prompt caching
+            cache_control: { type: "ephemeral" },
           },
           { type: "text", text: userText },
         ],
@@ -138,42 +132,23 @@ Si son Bases Integradas con montos reales, extrae con precisión y confianza≥0
   });
 
   const input = extractToolInput(message, EXTRACCION_TOOL.name);
-  if (!input) {
-    throw new Error("Claude no invocó el tool");
-  }
+  if (!input) throw new Error("Claude no invocó el tool");
 
-  return {
-    experienciaMonto: input.experiencia_monto_pen,
-    experienciaVecesVr: input.experiencia_veces_vr,
-    tiposObraSimilar: input.tipos_obra_similar || [],
-    antiguedadMaxAnios: input.antiguedad_max_anios,
-    experienciaObrasMin: input.experiencia_obras_min,
-    esBasesIntegradas: input.es_bases_integradas,
-    confianza: input.confianza ?? 0,
-    citas: input.citas || [],
-    notas: input.notas || null,
-    meta: {
-      model: message.model,
-      usage: message.usage,
-      wasCropped: trunc.wasCropped,
-      pagesAnalyzed: trunc.pagesIncluded || null,
-      truncatedFrom: trunc.wasCropped ? { totalPages: trunc.totalPages, originalMB: Math.round(trunc.originalSize / 1024 / 1024) } : null,
-    },
-  };
+  return mapToResult(input, {
+    provider: "claude",
+    model: message.model,
+    usage: message.usage,
+    wasCropped: trunc.wasCropped,
+    pagesAnalyzed: trunc.pagesIncluded || null,
+    truncatedFrom: trunc.wasCropped ? { totalPages: trunc.totalPages, originalMB: Math.round(trunc.originalSize / 1024 / 1024) } : null,
+  });
 }
 
-/**
- * Alternativa: analiza TEXTO ya extraído (para cuando tenemos texto pero regex falló).
- * Mucho más barato que PDF (solo texto tokens).
- */
 export async function extractRequisitosWithClaudeText(text, { valorReferencial = null } = {}) {
   if (!isLlmAvailable()) {
     throw new Error("ANTHROPIC_API_KEY no configurada");
   }
 
-  // SMART TEXT SELECTION: si el texto es largo, buscar sección "Requisitos de
-  // Calificación" (donde vive experiencia mínima) y mandar esa ventana.
-  // Fallback a primeros N chars si no encontramos el anchor.
   const MAX_CHARS = 40000;
   const truncated = text.length > MAX_CHARS;
   let textSlice = text;
@@ -189,13 +164,9 @@ export async function extractRequisitosWithClaudeText(text, { valorReferencial =
     let anchorIdx = -1;
     for (const a of anchors) {
       const idx = tlow.indexOf(a);
-      if (idx >= 0) {
-        anchorIdx = idx;
-        break;
-      }
+      if (idx >= 0) { anchorIdx = idx; break; }
     }
     if (anchorIdx >= 0) {
-      // ventana: 5k antes del anchor + 35k después
       const start = Math.max(0, anchorIdx - 5000);
       const end = Math.min(text.length, start + MAX_CHARS);
       textSlice = text.slice(start, end);
@@ -208,12 +179,8 @@ export async function extractRequisitosWithClaudeText(text, { valorReferencial =
 ---
 ${textSlice}
 ---
-${truncated ? `\n[texto truncado — ${text.length} chars totales, solo primeros ${MAX_CHARS}]` : ""}
-${
-  valorReferencial
-    ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")}.`
-    : ""
-}
+${truncated ? `\n[texto truncado — ${text.length} chars totales, enviados ${textSlice.length}]` : ""}
+${valorReferencial ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")}.` : ""}
 
 Extrae los requisitos de calificación del postor.`;
 
@@ -229,21 +196,117 @@ Extrae los requisitos de calificación del postor.`;
   const input = extractToolInput(message, EXTRACCION_TOOL.name);
   if (!input) throw new Error("Claude no invocó el tool");
 
+  return mapToResult(input, {
+    provider: "claude",
+    model: message.model,
+    usage: message.usage,
+    textLength: text.length,
+    truncated,
+  });
+}
+
+// ============================================================================
+// GEMINI (1M context, excelente OCR, 10x más barato)
+// ============================================================================
+
+/**
+ * Analiza un PDF con Gemini. Ventajas:
+ *  - Context 1M tokens → PDFs hasta ~1000 páginas sin truncar
+ *  - OCR nativo potente para escaneados
+ *  - 10× más barato en tokens input
+ *  - Rate limit más generoso
+ */
+export async function extractRequisitosWithGeminiPdf(buffer, { valorReferencial = null, filename = "bases.pdf" } = {}) {
+  if (!isGeminiAvailable()) {
+    throw new Error("GEMINI_API_KEY no configurada");
+  }
+
+  const sizeMB = Math.round(buffer.length / 1024 / 1024);
+  const base64 = buffer.toString("base64");
+
+  const userText = `Analiza este PDF de Bases SEACE (proceso de obra) y extrae los requisitos de calificación del postor.
+${valorReferencial ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")} (no confundir con la experiencia requerida).` : ""}
+
+Si es una Bases Estándar SIN rellenar (tiene placeholders [CONSIGNAR...], [ABC]), indica es_bases_integradas=false y confianza≤0.3.
+Si son Bases Integradas con montos reales rellenos, extrae con precisión y confianza≥0.8.
+
+Documento: ${filename} (${sizeMB}MB).`;
+
+  const result = await generateStructured({
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            inlineData: {
+              mimeType: "application/pdf",
+              data: base64,
+            },
+          },
+          { text: userText },
+        ],
+      },
+    ],
+  });
+
+  return mapToResult(result.data, {
+    provider: "gemini",
+    model: result.model,
+    usage: result.usage,
+    pdfSizeMB: sizeMB,
+  });
+}
+
+/**
+ * Analiza texto extraído con Gemini.
+ */
+export async function extractRequisitosWithGeminiText(text, { valorReferencial = null } = {}) {
+  if (!isGeminiAvailable()) {
+    throw new Error("GEMINI_API_KEY no configurada");
+  }
+
+  // Gemini tiene 1M context — no necesita truncar casi nunca
+  const MAX_CHARS = 500_000; // más generoso que Claude
+  const truncated = text.length > MAX_CHARS;
+  const textSlice = truncated ? text.slice(0, MAX_CHARS) : text;
+
+  const userText = `Texto extraído de Bases SEACE (proceso de obra):
+---
+${textSlice}
+---
+${truncated ? `\n[texto truncado — ${text.length} chars totales]` : ""}
+${valorReferencial ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")}.` : ""}
+
+Extrae los requisitos de calificación del postor.`;
+
+  const result = await generateStructured({
+    contents: [{ role: "user", parts: [{ text: userText }] }],
+  });
+
+  return mapToResult(result.data, {
+    provider: "gemini",
+    model: result.model,
+    usage: result.usage,
+    textLength: text.length,
+    truncated,
+  });
+}
+
+// ============================================================================
+// UTILS
+// ============================================================================
+
+function mapToResult(data, meta) {
   return {
-    experienciaMonto: input.experiencia_monto_pen,
-    experienciaVecesVr: input.experiencia_veces_vr,
-    tiposObraSimilar: input.tipos_obra_similar || [],
-    antiguedadMaxAnios: input.antiguedad_max_anios,
-    experienciaObrasMin: input.experiencia_obras_min,
-    esBasesIntegradas: input.es_bases_integradas,
-    confianza: input.confianza ?? 0,
-    citas: input.citas || [],
-    notas: input.notas || null,
-    meta: {
-      model: message.model,
-      usage: message.usage,
-      textLength: text.length,
-      truncated,
-    },
+    experienciaMonto: data.experiencia_monto_pen,
+    experienciaVecesVr: data.experiencia_veces_vr,
+    tiposObraSimilar: data.tipos_obra_similar || [],
+    antiguedadMaxAnios: data.antiguedad_max_anios,
+    experienciaObrasMin: data.experiencia_obras_min,
+    esBasesIntegradas: data.es_bases_integradas,
+    confianza: data.confianza ?? 0,
+    citas: data.citas || [],
+    notas: data.notas || null,
+    meta,
   };
 }

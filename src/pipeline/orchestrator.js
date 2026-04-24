@@ -9,10 +9,40 @@ import { analizarRequisitos } from "../analyzer/requisitos.js";
 import { evaluarProceso } from "../analyzer/evaluator.js";
 import { cleanDownloadsDir } from "../browserPool.js";
 import { isLlmAvailable } from "../llm/claude.js";
+import { isGeminiAvailable } from "../llm/gemini.js";
 import {
   extractRequisitosWithClaudePdf,
   extractRequisitosWithClaudeText,
+  extractRequisitosWithGeminiPdf,
+  extractRequisitosWithGeminiText,
 } from "../analyzer/llmExtractor.js";
+
+/**
+ * Elige provider óptimo según el caso:
+ *  - PDF escaneado O muy grande (>40 pág) → Gemini PDF (context 1M, OCR fuerte)
+ *  - Texto largo (>100k chars) → Gemini text (context 1M)
+ *  - Texto chico OK → Claude text (rápido, barato para texto)
+ *  - PDF chico (<40 pag) escaneado → Claude PDF (si Gemini no disponible)
+ *
+ * llmProvider: 'auto' | 'claude' | 'gemini'
+ */
+function pickLlmProvider({ tipo, pageCount, textLength, escaneado, llmProvider = "auto" }) {
+  const claudeOk = isLlmAvailable();
+  const geminiOk = isGeminiAvailable();
+
+  if (llmProvider === "claude" && claudeOk) return "claude";
+  if (llmProvider === "gemini" && geminiOk) return "gemini";
+
+  // auto
+  if (!claudeOk && !geminiOk) return null;
+  if (!claudeOk) return "gemini";
+  if (!geminiOk) return "claude";
+
+  // ambos disponibles: elegir por tamaño
+  if (escaneado || (pageCount && pageCount > 40)) return "gemini";
+  if (textLength && textLength > 100_000) return "gemini";
+  return "claude"; // caso normal: texto chico/mediano → Claude
+}
 
 const DEBUG_DIR = "./data/debug/pdftext";
 const DUMP_MAX_FILES = 20;
@@ -167,8 +197,9 @@ export async function runObraPipeline({
   concurrency = 2,
   onProgress = () => {},
   skipPdf = false,
-  useLlm = isLlmAvailable(), // auto si ANTHROPIC_API_KEY está en env
+  useLlm = isLlmAvailable() || isGeminiAvailable(),
   llmPolicy = "fallback", // 'fallback' = solo si regex falla | 'always' = siempre
+  llmProvider = "auto", // 'auto' | 'claude' | 'gemini'
 } = {}) {
   const runStart = Date.now();
   const emit = (step, data) => {
@@ -299,17 +330,30 @@ export async function runObraPipeline({
         }
       }
 
-      // CASO ESPECIAL: escaneado Y Claude disponible → fallback LLM directo sobre el PDF
+      // CASO ESPECIAL: escaneado Y LLM disponible → OCR directo sobre el PDF
       if (analisis.calidadTexto.escaneado && useLlm && pdfForOcr) {
         try {
-          emit("llm", { msg: `${p.nomenclatura} → Claude OCR (escaneado)` });
-          const vr = detalle.vrCuantiaMonto || p.vrCuantia;
-          const llm = await extractRequisitosWithClaudePdf(pdfForOcr, {
-            valorReferencial: vr,
-            filename: descarga.filename,
+          // para escaneados GRANDES preferimos Gemini (1M context, OCR mejor)
+          const provider = pickLlmProvider({
+            tipo: "pdf",
+            escaneado: true,
+            pageCount: doc.meta?.pages || 0,
+            llmProvider,
           });
-          analisis.requisitos = mapLlmToRequisitos(llm, { fuente: `claude-pdf-ocr` });
-          analisis.llmUsed = { via: "pdf-ocr", ...llm.meta };
+          emit("llm", { msg: `${p.nomenclatura} → ${provider} OCR (escaneado)` });
+          const vr = detalle.vrCuantiaMonto || p.vrCuantia;
+          const llm =
+            provider === "gemini"
+              ? await extractRequisitosWithGeminiPdf(pdfForOcr, {
+                  valorReferencial: vr,
+                  filename: descarga.filename,
+                })
+              : await extractRequisitosWithClaudePdf(pdfForOcr, {
+                  valorReferencial: vr,
+                  filename: descarga.filename,
+                });
+          analisis.requisitos = mapLlmToRequisitos(llm, { fuente: `${provider}-pdf-ocr` });
+          analisis.llmUsed = { via: `${provider}-pdf-ocr`, provider, ...llm.meta };
           if (!llm.esBasesIntegradas || llm.confianza < 0.3 || llm.experienciaMonto == null) {
             analisis.evaluacion = {
               resultado: "indeterminado",
@@ -326,7 +370,7 @@ export async function runObraPipeline({
               { consorcioRatio: 0.5 }
             );
             analisis.evaluacion.razones.unshift(
-              `Extracción por Claude (PDF escaneado, OCR): confianza ${llm.confianza.toFixed(2)}`
+              `Extracción por ${provider} (PDF escaneado, OCR): confianza ${llm.confianza.toFixed(2)}`
             );
           }
           enriquecidos.push({ listado: p, detalle, analisis });
@@ -412,24 +456,38 @@ export async function runObraPipeline({
 
       if (debeLlm) {
         try {
-          emit("llm", {
-            msg: `${p.nomenclatura} → Claude (${regexFallo ? "regex fallo" : regexSospechoso ? "sospecha" : esTemplate ? "template" : "reforzar"})`,
-          });
           const vr = detalle.vrCuantiaMonto || p.vrCuantia;
-
-          // ESTRATEGIA: preferir TEXT (10× más barato en tokens).
-          // Solo usar PDF si no hay texto extraído bueno (ej. escaneado que NO pasó el
-          // filtro de escaneado antes, caso raro).
           const textOk = doc.text && doc.text.length > 500;
+
+          const provider = pickLlmProvider({
+            tipo: textOk ? "text" : "pdf",
+            escaneado: false,
+            pageCount: doc.meta?.pages || 0,
+            textLength: doc.text?.length || 0,
+            llmProvider,
+          });
+          const reason = regexFallo ? "regex fallo" : regexSospechoso ? "sospecha" : esTemplate ? "template" : "reforzar";
+          emit("llm", {
+            msg: `${p.nomenclatura} → ${provider} ${textOk ? "text" : "pdf"} (${reason})`,
+          });
+
           const llm = textOk
-            ? await extractRequisitosWithClaudeText(doc.text, { valorReferencial: vr })
+            ? provider === "gemini"
+              ? await extractRequisitosWithGeminiText(doc.text, { valorReferencial: vr })
+              : await extractRequisitosWithClaudeText(doc.text, { valorReferencial: vr })
+            : provider === "gemini"
+            ? await extractRequisitosWithGeminiPdf(descarga.buffer, {
+                valorReferencial: vr,
+                filename: descarga.filename,
+              })
             : await extractRequisitosWithClaudePdf(descarga.buffer, {
                 valorReferencial: vr,
                 filename: descarga.filename,
               });
 
           analisis.llmUsed = {
-            via: textOk ? "text" : "pdf-native",
+            via: `${provider}-${textOk ? "text" : "pdf"}`,
+            provider,
             ...llm.meta,
             citas: llm.citas,
             notas: llm.notas,
@@ -438,7 +496,7 @@ export async function runObraPipeline({
           // LLM pisa regex si tiene mayor confianza o regex falló
           if (llm.experienciaMonto != null && (regexFallo || llm.confianza > requisitos.experienciaConfianza)) {
             analisis.requisitos = mapLlmToRequisitos(llm, {
-              fuente: `claude-${descarga.tipo === "pdf" ? "pdf" : "text"}`,
+              fuente: `${provider}-${textOk ? "text" : "pdf"}`,
             });
 
             if (llm.esBasesIntegradas && llm.confianza >= 0.5) {
@@ -452,7 +510,7 @@ export async function runObraPipeline({
                 { consorcioRatio: 0.5 }
               );
               analisis.evaluacion.razones.unshift(
-                `Extracción por Claude (confianza ${llm.confianza.toFixed(2)}, citas: ${llm.citas.length})`
+                `Extracción por ${provider} (confianza ${llm.confianza.toFixed(2)}, citas: ${llm.citas.length})`
               );
             } else {
               analisis.evaluacion = {

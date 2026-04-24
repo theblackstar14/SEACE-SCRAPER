@@ -32,6 +32,8 @@ function parseArgs(argv) {
     else if (a === "--slow-mo") args.slowMo = Number(next) || 250, i++;
     else if (a === "--no-llm") args.noLlm = true;
     else if (a === "--llm-always") args.llmAlways = true;
+    else if (a === "--prefer-claude") args.llmProvider = "claude";
+    else if (a === "--prefer-gemini") args.llmProvider = "gemini";
     else if (a === "--help" || a === "-h") {
       console.log(
         `Usage: node src/cli/run-obra.js [opts]\n` +
@@ -45,8 +47,10 @@ function parseArgs(argv) {
           `  --skip-pdf         no descarga/analiza PDFs (rápido para debug)\n` +
           `  --headed           abre Chromium visible (debug visual)\n` +
           `  --slow-mo N        delay en ms entre acciones (default 250 si --headed)\n` +
-          `  --no-llm           desactiva fallback Claude aunque haya ANTHROPIC_API_KEY\n` +
-          `  --llm-always       usa Claude para TODOS los procesos (no solo fallback)\n`
+          `  --no-llm           desactiva LLM aunque haya keys configuradas\n` +
+          `  --llm-always       usa LLM para TODOS los procesos (no solo fallback)\n` +
+          `  --prefer-claude    fuerza usar Claude (si hay key)\n` +
+          `  --prefer-gemini    fuerza usar Gemini (si hay key)\n`
       );
       process.exit(0);
     }
@@ -75,16 +79,25 @@ async function main() {
   // cargar empresa
   const empresa = JSON.parse(await fs.readFile(args.empresa, "utf8"));
 
-  const llmDisponible = !!process.env.ANTHROPIC_API_KEY;
+  const claudeKey = !!process.env.ANTHROPIC_API_KEY;
+  const geminiKey = !!process.env.GEMINI_API_KEY;
+  const llmDisponible = claudeKey || geminiKey;
   const useLlm = llmDisponible && !args.noLlm;
   const llmPolicy = args.llmAlways ? "always" : "fallback";
+  const llmProvider = args.llmProvider || "auto";
+
+  const providerLabel = !useLlm
+    ? llmDisponible ? "off (--no-llm)" : "off (sin API keys)"
+    : llmProvider === "auto"
+      ? `✨ ON auto [${[claudeKey && "claude", geminiKey && "gemini"].filter(Boolean).join("+")}]`
+      : `✨ ON forced ${llmProvider}`;
 
   console.log(`\n🏗️  SEACE Obra Pipeline`);
   console.log(`   Empresa:  ${empresa.razonSocial} (RUC ${empresa.ruc})`);
   console.log(`   Rango:    ${fechaDesde} → ${fechaHasta}`);
   console.log(`   Límite:   ${args.limit} procesos`);
   console.log(`   SkipPDF:  ${!!args.skipPdf}`);
-  console.log(`   Claude:   ${useLlm ? `✨ ON (${llmPolicy})` : llmDisponible ? "off (--no-llm)" : "off (sin API key)"}\n`);
+  console.log(`   LLM:      ${providerLabel} (${llmPolicy})\n`);
 
   const store = createJsonStore(args.out);
   const runId = store.newRunId();
@@ -103,6 +116,7 @@ async function main() {
       skipPdf: !!args.skipPdf,
       useLlm,
       llmPolicy,
+      llmProvider,
     });
 
     const file = await store.saveRun(runId, payload);
@@ -118,7 +132,14 @@ async function main() {
     console.log(`   Escaneados:      ${payload.resumen.escaneados}`);
     console.log(`   Templates:       ${payload.resumen.templates}`);
     if (payload.resumen.llmEnabled) {
-      console.log(`   ✨ Claude:        ${payload.resumen.llmUsed} procesos analizados`);
+      const byProvider = payload.procesos
+        .filter((p) => p.llmUsed?.provider)
+        .reduce((acc, p) => {
+          acc[p.llmUsed.provider] = (acc[p.llmUsed.provider] || 0) + 1;
+          return acc;
+        }, {});
+      const breakdown = Object.entries(byProvider).map(([k, v]) => `${k}:${v}`).join(", ");
+      console.log(`   ✨ LLM:           ${payload.resumen.llmUsed} procesos${breakdown ? ` (${breakdown})` : ""}`);
     }
     console.log(`   Duración:        ${(payload.resumen.duracionMs / 1000).toFixed(1)}s`);
   } finally {
