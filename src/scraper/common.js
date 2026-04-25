@@ -326,7 +326,7 @@ export async function collectAllPages(page, { maxRows = Infinity, maxPages = 50 
  * Fallback: compara nomenclatura normalizada.
  * Si no está, intenta paginar hasta encontrar.
  */
-export async function findRow(page, { nomenclatura, nidProceso, maxPages = 20 }) {
+export async function findRow(page, { nomenclatura, nidProceso, maxPages = 35 }) {
   for (let p = 0; p < maxPages; p++) {
     const handle = await page.evaluateHandle(
       ({ sel, nom, nid }) => {
