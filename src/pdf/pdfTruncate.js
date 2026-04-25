@@ -14,10 +14,22 @@ const CLAUDE_PDF_LIMIT_BYTES = 24 * 1024 * 1024; // 24MB raw
 const DEFAULT_MAX_PAGES = 40; // ~80-120k tokens — margen cómodo bajo 200k
 
 /**
- * En Bases SEACE los requisitos de calificación (Capítulo III) suelen
- * estar al medio-final del documento, no al inicio. Si el PDF es muy
- * grande tomamos un rango SMART: primeras 5 (índice/datos generales)
- * + páginas del "medio" (donde está Cap III típicamente).
+ * Estructura típica Bases SEACE:
+ *   - Sección General (pags 1-15): disposiciones comunes, glosario
+ *   - Cap I Generalidades (pags 15-25)
+ *   - Cap II Procedimiento (pags 25-40)
+ *   - **Cap III Requerimientos / Requisitos de Calificación** (pags 40-70) ← KEY
+ *   - Cap IV Factores de evaluación (pags 70-80)
+ *   - Anexos (pags 80+)
+ *
+ * Los REQUISITOS DEL POSTOR (experiencia mínima, tipos obra, antigüedad)
+ * viven en Capítulo III. Empíricamente en PDFs de 80-120 pág están en la
+ * mitad-final (~60-90%).
+ *
+ * Estrategia: HEAD + TAIL
+ *   - head: primeras 5 (intro, datos generales, cronograma)
+ *   - tail: últimas N (donde vive Cap III + Cap IV)
+ * Cubre Cap III/IV que casi siempre están antes de los Anexos finales.
  */
 async function smartPageSelection(srcDoc, maxPages) {
   const total = srcDoc.getPageCount();
@@ -25,22 +37,17 @@ async function smartPageSelection(srcDoc, maxPages) {
     return Array.from({ length: total }, (_, i) => i);
   }
 
-  // estrategia: primeras 5 (intro, cronograma, datos) + medio
   const headSize = 5;
-  const restSize = maxPages - headSize;
+  const tailSize = maxPages - headSize;
 
-  // el "medio" tipo ~30% del doc. Ej: doc 100 pags, max 40 → head[0..4] + mid[25..59]
-  const midStart = Math.floor(total * 0.25);
-  const midEnd = Math.min(midStart + restSize, total);
-  const adjMidStart = midEnd - restSize; // ajuste si no llega
+  const indices = new Set();
+  for (let i = 0; i < headSize; i++) indices.add(i);
 
-  const indices = [];
-  for (let i = 0; i < headSize; i++) indices.push(i);
-  for (let i = adjMidStart; i < midEnd; i++) {
-    if (!indices.includes(i)) indices.push(i);
-  }
+  // cola: últimas tailSize páginas
+  const tailStart = Math.max(headSize, total - tailSize);
+  for (let i = tailStart; i < total; i++) indices.add(i);
 
-  return indices.sort((a, b) => a - b);
+  return [...indices].sort((a, b) => a - b);
 }
 
 /**
