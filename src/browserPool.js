@@ -65,7 +65,7 @@ async function getBrowser() {
   // slow-mo útil para debugging visual cuando corres con HEADLESS=false
   if (!config.headless && process.env.SLOW_MO) {
     launchOpts.slowMo = Number(process.env.SLOW_MO) || 250;
-    console.log(`🐢 slowMo ${launchOpts.slowMo}ms`);
+    console.log(`[browser] slowMo ${launchOpts.slowMo}ms`);
   }
   if (process.env.PROXY_SERVER) {
     launchOpts.proxy = {
@@ -73,7 +73,7 @@ async function getBrowser() {
       username: process.env.PROXY_USER,
       password: process.env.PROXY_PASS,
     };
-    console.log("🌐 Proxy:", process.env.PROXY_SERVER);
+    console.log("[browser] Proxy:", process.env.PROXY_SERVER);
   }
 
   launching = chromium.launch(launchOpts).then((b) => {

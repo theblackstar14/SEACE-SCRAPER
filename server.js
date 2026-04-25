@@ -90,7 +90,7 @@ function sanitizeFilename(name) {
 }
 
 function sendError(res, req, e, status = 500) {
-  console.error(`[${req.id}] ❌ ${req.path}`, e);
+  console.error(`[${req.id}] [ERROR] ${req.path}`, e);
   const body = { error: e.message || "internal_error" };
   if (!IS_PROD) body.stack = e.stack;
   res.status(status).json(body);
@@ -244,11 +244,11 @@ app.post("/api/v1/cache/purge", (req, res) => {
 // ---------- server ----------
 const port = Number(process.env.PORT) || 3000;
 const server = app.listen(port, "0.0.0.0", () => {
-  console.log(`🚀 SEACE API :${port} (concurrency=${process.env.SCRAPE_CONCURRENCY || 2}, auth=${API_KEY ? "on" : "off"})`);
+  console.log(`[api] SEACE API :${port} (concurrency=${process.env.SCRAPE_CONCURRENCY || 2}, auth=${API_KEY ? "on" : "off"})`);
 });
 
 async function shutdown() {
-  console.log("\n👋 cerrando...");
+  console.log("\n[api] cerrando...");
   await shutdownBrowser();
   server.close(() => process.exit(0));
 }

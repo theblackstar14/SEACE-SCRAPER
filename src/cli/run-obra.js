@@ -97,21 +97,21 @@ async function main() {
   const providerLabel = !useLlm
     ? llmDisponible ? "off (--no-llm)" : "off (sin API keys)"
     : llmProvider === "auto"
-      ? `✨ ON auto [${[claudeKey && "claude", geminiKey && "gemini"].filter(Boolean).join("+")}]`
-      : `✨ ON forced ${llmProvider}`;
+      ? `ON auto [${[claudeKey && "claude", geminiKey && "gemini"].filter(Boolean).join("+")}]`
+      : `ON forced ${llmProvider}`;
 
   const minDias = args.minDias ?? 15;
   const maxMontoRatio = args.maxMontoRatio ?? 2;
   const maxPubDias = args.maxPubDias ?? 30;
   const maxDocMB = args.maxDocMB ?? 50;
 
-  console.log(`\n🏗️  SEACE Obra Pipeline`);
+  console.log(`\nSEACE Obra Pipeline`);
   console.log(`   Empresa:  ${empresa.razonSocial} (RUC ${empresa.ruc})`);
-  console.log(`   Rango:    ${fechaDesde} → ${fechaHasta}`);
-  console.log(`   Límite:   ${args.limit} procesos`);
+  console.log(`   Rango:    ${fechaDesde} -> ${fechaHasta}`);
+  console.log(`   Limite:   ${args.limit} procesos`);
   console.log(`   SkipPDF:  ${!!args.skipPdf}`);
   console.log(`   LLM:      ${providerLabel} (${llmPolicy})`);
-  console.log(`   Filtros:  >=${minDias}d antes presentación · VR <= ${maxMontoRatio}× capacidad · pubFecha <= ${maxPubDias}d · doc <= ${maxDocMB}MB\n`);
+  console.log(`   Filtros:  >=${minDias}d antes presentacion | VR <= ${maxMontoRatio}x capacidad | pubFecha <= ${maxPubDias}d | doc <= ${maxDocMB}MB\n`);
 
   const store = createJsonStore(args.out);
   const runId = store.newRunId();
@@ -138,18 +138,18 @@ async function main() {
     });
 
     const file = await store.saveRun(runId, payload);
-    console.log(`\n✅ Guardado en: ${file}`);
-    console.log(`\n📊 Resumen:`);
+    console.log(`\nGuardado en: ${file}`);
+    console.log(`\nResumen:`);
     console.log(`   Listados:           ${payload.resumen.totalListados}`);
     console.log(`   Pre-filtro pasaron: ${payload.resumen.preFiltroPasaron}/${payload.resumen.limit} (descartados: ${payload.resumen.descartadosPrefiltro})`);
-    console.log(`   Cronogramas leídos: ${payload.resumen.cronogramasLeidos}`);
+    console.log(`   Cronogramas leidos: ${payload.resumen.cronogramasLeidos}`);
     console.log(`   Tiempo suficiente:  ${payload.resumen.conTiempoSuficiente}`);
     console.log(`   Detalle completo:   ${payload.resumen.detalleCompleto}`);
-    console.log(`   ─────────────────────`);
-    console.log(`   ✅ Califican:        ${payload.resumen.califican}`);
-    console.log(`   🤝 Consorcio:        ${payload.resumen.consorcio}`);
-    console.log(`   ❌ No califican:     ${payload.resumen.noCalifican}`);
-    console.log(`   ❓ Indeterminados:   ${payload.resumen.indeterminados}`);
+    console.log(`   --------------------`);
+    console.log(`   Califican:          ${payload.resumen.califican}`);
+    console.log(`   Consorcio:          ${payload.resumen.consorcio}`);
+    console.log(`   No califican:       ${payload.resumen.noCalifican}`);
+    console.log(`   Indeterminados:     ${payload.resumen.indeterminados}`);
     console.log(`      escaneados:      ${payload.resumen.escaneados}`);
     console.log(`      templates:       ${payload.resumen.templates}`);
     if (payload.resumen.llmEnabled) {
@@ -160,24 +160,24 @@ async function main() {
           return acc;
         }, {});
       const breakdown = Object.entries(byProvider).map(([k, v]) => `${k}:${v}`).join(", ");
-      console.log(`   ✨ LLM:              ${payload.resumen.llmUsed} procesos${breakdown ? ` (${breakdown})` : ""}`);
+      console.log(`   LLM usado:          ${payload.resumen.llmUsed} procesos${breakdown ? ` (${breakdown})` : ""}`);
     }
     if (payload.resumen.cacheHashHits) {
-      console.log(`   📦 Cache hash hits:  ${payload.resumen.cacheHashHits} (ahorró LLM calls)`);
+      console.log(`   Cache hash hits:    ${payload.resumen.cacheHashHits} (ahorro LLM calls)`);
     }
     if (payload.resumen.dedupRuntimeHits) {
-      console.log(`   ♻️  Dedup runtime:    ${payload.resumen.dedupRuntimeHits} (reuso descarga)`);
+      console.log(`   Dedup runtime:      ${payload.resumen.dedupRuntimeHits} (reuso descarga)`);
     }
-    console.log(`   Duración:           ${(payload.resumen.duracionMs / 1000).toFixed(1)}s`);
+    console.log(`   Duracion:           ${(payload.resumen.duracionMs / 1000).toFixed(1)}s`);
 
     // Top 5 procesos por score
     const top = payload.procesos.slice(0, 5);
     if (top.length) {
-      console.log(`\n🏆 Top ${top.length} por score:`);
+      console.log(`\nTop ${top.length} por score:`);
       top.forEach((p, i) => {
         const result = p.evaluacion.resultado.padEnd(15);
         const score = String(p.score || 0).padStart(3);
-        console.log(`   ${i + 1}. [${score}] ${result} ${p.nomenclatura} (${p.diasRestantes ?? "?"}d)`);
+        console.log(`   ${i + 1}. [${score}] ${result} ${p.nomenclatura} (${p.diasRestantes ?? "?"}d) - ${(p.entidad || "").slice(0, 40)}`);
       });
     }
   } finally {
@@ -186,6 +186,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error("❌ Pipeline falló:", e);
+  console.error("[ERROR] Pipeline fallo:", e);
   shutdownBrowser().finally(() => process.exit(1));
 });

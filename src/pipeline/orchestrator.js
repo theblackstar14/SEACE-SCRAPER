@@ -517,7 +517,7 @@ export async function runObraPipeline({
       if (cachedSospecha) {
         analisis.evaluacion = {
           resultado: "indeterminado",
-          razones: [`📦 Cache hit + sospecha: ${cachedSospecha}`],
+          razones: [`[cache] hit + sospecha: ${cachedSospecha}`],
         };
         analisis.warnings.push(`cache-sospecha: ${cachedSospecha}`);
       } else if (cached.requisitos?.experienciaMonto) {
@@ -530,11 +530,11 @@ export async function runObraPipeline({
           empresa,
           { consorcioRatio: 0.5 }
         );
-        analisis.evaluacion.razones.unshift(`📦 Cache hit (hash ${docHash.slice(0, 8)})`);
+        analisis.evaluacion.razones.unshift(`[cache] hit (hash ${docHash.slice(0, 8)})`);
       } else {
         analisis.evaluacion = cached.evaluacion || {
           resultado: "indeterminado",
-          razones: [`📦 Cache hit: ${cached.calidadTexto?.razonCalidad || "sin requisitos extraíbles"}`],
+          razones: [`[cache] hit: ${cached.calidadTexto?.razonCalidad || "sin requisitos extraíbles"}`],
         };
       }
       enriquecidos.push({ listado: p, detalle, analisis });
@@ -845,12 +845,17 @@ export async function runObraPipeline({
   // 7. BUILD OUTPUT con score y sort
   const procesos = enriquecidos
     .map(({ listado: p, detalle, analisis }) => {
+      const descripcionFull = detalle.descripcion || p.descripcion || "";
+      const descripcionCorta = descripcionFull.slice(0, 120);
       const proceso = {
-        id: p.nidProceso,
-        nidConvocatoria: p.nidConvocatoria,
+        // identificación principal (orden visible)
         nomenclatura: p.nomenclatura,
         entidad: detalle.entidad || p.entidad,
-        descripcion: detalle.descripcion || p.descripcion,
+        descripcionCorta,
+        descripcion: descripcionFull,
+        // IDs internos
+        id: p.nidProceso,
+        nidConvocatoria: p.nidConvocatoria,
         objeto: detalle.objeto || p.objetoContratacion,
         valorReferencial: detalle.vrCuantiaMonto ?? p.vrCuantia ?? null,
         moneda: p.moneda || "PEN",
