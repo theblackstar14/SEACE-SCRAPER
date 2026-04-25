@@ -915,6 +915,19 @@ export async function runObraPipeline({
     duracionMs: Date.now() - runStart,
   };
 
+  // buffers descargados (Map nidProceso -> buffer) — para subir a Storage si se requiere
+  const buffers = new Map();
+  for (const item of activos) {
+    if (item.descarga?.buffer && item.listado?.nidProceso) {
+      buffers.set(item.listado.nidProceso, {
+        buffer: item.descarga.buffer,
+        filename: item.descarga.filename,
+        tipo: item.descarga.tipo,
+        size: item.descarga.size,
+      });
+    }
+  }
+
   // cleanup final: temps de descarga ya no se necesitan
   cleanDownloadsDir();
 
@@ -926,5 +939,6 @@ export async function runObraPipeline({
     empresa: { razonSocial: empresa.razonSocial, ruc: empresa.ruc },
     resumen,
     procesos,
+    _buffers: buffers, // NO se persiste en JSON, solo runtime
   };
 }

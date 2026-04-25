@@ -4,6 +4,8 @@ import { scrapeSeace } from "./src/scraper/seaceScraper.js";
 import { scrapeDetalle, descargarDoc } from "./src/scraper/seaceDetalle.js";
 import { cache, swr, procesoRegistry, registerProcesos } from "./src/cache.js";
 import { shutdownBrowser, poolStats } from "./src/browserPool.js";
+import { createSupabaseStore, isSupabaseAvailable } from "./src/store/supabaseStore.js";
+import { downloadBases, getSignedUrl } from "./src/store/supabaseStorage.js";
 
 const app = express();
 app.disable("x-powered-by");
@@ -239,6 +241,110 @@ app.post("/api/v1/cache/purge", (req, res) => {
     listCache.clear(); detalleCache.clear(); pdfCache.clear();
   }
   res.json({ ok: true });
+});
+
+// ============================================================================
+// API v2: lee de Supabase. Para consumo del ERP.
+// ============================================================================
+
+// GET /api/v2/procesos?resultado=califica&minDias=15&minScore=50&limit=20
+// Lista procesos analizados (último análisis por nid_proceso).
+app.get("/api/v2/procesos", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const { resultado, estado, minScore, minDias, orderBy, direction, limit, offset } = req.query;
+    const result = await sb.queryProcesos({
+      resultado,
+      estado,
+      minScore: minScore ? Number(minScore) : undefined,
+      minDias: minDias ? Number(minDias) : undefined,
+      orderBy: orderBy || "score",
+      direction: direction || "desc",
+      limit: Math.min(Number(limit) || 50, 500),
+      offset: Number(offset) || 0,
+    });
+    res.json(result);
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+// GET /api/v2/procesos/:nidProceso
+// Detalle completo del último análisis de un proceso, con documentos.
+app.get("/api/v2/procesos/:nidProceso", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const proceso = await sb.getProceso(req.params.nidProceso);
+    if (!proceso) return res.status(404).json({ error: "proceso no encontrado" });
+    const documentos = await sb.getDocumentos(req.params.nidProceso);
+    res.json({ proceso, documentos });
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+// GET /api/v2/procesos/:nidProceso/documentos/:docId/download
+// Stream del archivo desde Supabase Storage al cliente.
+app.get("/api/v2/procesos/:nidProceso/documentos/:docId/download", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const docs = await sb.getDocumentos(req.params.nidProceso);
+    const doc = docs.find((d) => String(d.id) === req.params.docId);
+    if (!doc) return res.status(404).json({ error: "documento no encontrado" });
+    if (!doc.storage_path) return res.status(404).json({ error: "documento sin storage_path" });
+
+    const buffer = await downloadBases(doc.storage_path);
+    const safeName = sanitizeFilename(doc.filename);
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(buffer);
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+// GET /api/v2/procesos/:nidProceso/documentos/:docId/url
+// Devuelve URL firmada (válida 1h) — útil para download directo desde frontend.
+app.get("/api/v2/procesos/:nidProceso/documentos/:docId/url", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const docs = await sb.getDocumentos(req.params.nidProceso);
+    const doc = docs.find((d) => String(d.id) === req.params.docId);
+    if (!doc?.storage_path) return res.status(404).json({ error: "documento no encontrado" });
+    const url = await getSignedUrl(doc.storage_path, { expiresIn: 3600 });
+    res.json({ url, filename: doc.filename, expiresIn: 3600 });
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+// GET /api/v2/runs — lista runs recientes
+app.get("/api/v2/runs", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const runs = await sb.listRuns(Math.min(Number(req.query.limit) || 50, 200));
+    res.json({ data: runs });
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+// GET /api/v2/last-run — último run con sus procesos
+app.get("/api/v2/last-run", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const last = await sb.getLastRun();
+    res.json(last || { run: null, procesos: [] });
+  } catch (e) {
+    sendError(res, req, e);
+  }
 });
 
 // ---------- server ----------

@@ -551,6 +551,19 @@ export async function runObraPipelineHttp({
     pipelineMode: "http",
   };
 
+  // buffers para upload a Storage si requerido
+  const buffers = new Map();
+  for (const item of detallados) {
+    if (item.descarga?.buffer && item.listado?.nidProceso) {
+      buffers.set(item.listado.nidProceso, {
+        buffer: item.descarga.buffer,
+        filename: item.descarga.filename,
+        tipo: item.descarga.tipo,
+        size: item.descarga.size,
+      });
+    }
+  }
+
   cleanDownloadsDir();
   emit("done", { msg: JSON.stringify(resumen) });
 
@@ -560,5 +573,6 @@ export async function runObraPipelineHttp({
     empresa: { razonSocial: empresa.razonSocial, ruc: empresa.ruc },
     resumen,
     procesos,
+    _buffers: buffers,
   };
 }

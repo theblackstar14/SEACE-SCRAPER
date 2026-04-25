@@ -10,9 +10,12 @@
  *   node src/cli/run-obra.js --skip-pdf                   # debug: no baja PDFs
  */
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { runObraPipeline } from "../pipeline/orchestrator.js";
 import { runObraPipelineHttp } from "../pipeline/orchestratorHttp.js";
 import { createJsonStore } from "../store/jsonStore.js";
+import { createSupabaseStore, isSupabaseAvailable } from "../store/supabaseStore.js";
+import { uploadBases } from "../store/supabaseStorage.js";
 import { formatSeaceDate } from "../scraper/common.js";
 import { shutdownBrowser } from "../browserPool.js";
 
@@ -40,6 +43,8 @@ function parseArgs(argv) {
     else if (a === "--max-pub-dias") args.maxPubDias = Number(next), i++;
     else if (a === "--max-doc-mb") args.maxDocMB = Number(next), i++;
     else if (a === "--http") args.useHttp = true;
+    else if (a === "--supabase") args.useSupabase = true;
+    else if (a === "--no-supabase") args.noSupabase = true;
     else if (a === "--help" || a === "-h") {
       console.log(
         `Usage: node src/cli/run-obra.js [opts]\n` +
@@ -61,7 +66,9 @@ function parseArgs(argv) {
           `  --max-monto-ratio  VR <= empresa.capacidad × N (default 2)\n` +
           `  --max-pub-dias N   descarta si pubFecha > N días (default 30)\n` +
           `  --max-doc-mb N     skip download si Bases > N MB (default 50)\n` +
-          `  --http             usa pipeline HTTP directo (10x mas rapido, experimental)\n`
+          `  --http             usa pipeline HTTP directo (10x mas rapido, experimental)\n` +
+          `  --supabase         persiste run + procesos + PDFs en Supabase (auto si SUPABASE_URL en env)\n` +
+          `  --no-supabase      desactiva persist a Supabase (solo JSON local)\n`
       );
       process.exit(0);
     }
@@ -113,6 +120,8 @@ async function main() {
   console.log(`   Rango:    ${fechaDesde} -> ${fechaHasta}`);
   console.log(`   Limite:   ${args.limit} procesos`);
   console.log(`   Pipeline: ${args.useHttp ? "HTTP DIRECTO (rapido)" : "Playwright (clasico)"}`);
+  const sbActive = (args.useSupabase ?? (isSupabaseAvailable() && !args.noSupabase)) && isSupabaseAvailable();
+  console.log(`   Supabase: ${sbActive ? "ON (DB + Storage)" : isSupabaseAvailable() ? "off (--no-supabase)" : "off (sin SUPABASE_URL)"}`);
   console.log(`   SkipPDF:  ${!!args.skipPdf}`);
   console.log(`   LLM:      ${providerLabel} (${llmPolicy})`);
   console.log(`   Filtros:  >=${minDias}d antes presentacion | VR <= ${maxMontoRatio}x capacidad | pubFecha <= ${maxPubDias}d | doc <= ${maxDocMB}MB\n`);
@@ -142,8 +151,55 @@ async function main() {
       maxDocMB,
     });
 
-    const file = await store.saveRun(runId, payload);
+    // separar buffers (no van al JSON local)
+    const buffers = payload._buffers || new Map();
+    const payloadForJson = { ...payload };
+    delete payloadForJson._buffers;
+
+    const file = await store.saveRun(runId, payloadForJson);
     console.log(`\nGuardado en: ${file}`);
+
+    // PERSIST a Supabase si configurado
+    const useSupabase =
+      args.useSupabase ?? (isSupabaseAvailable() && !args.noSupabase);
+    if (useSupabase && isSupabaseAvailable()) {
+      try {
+        const sb = createSupabaseStore();
+        console.log(`\n[supabase] persistiendo run + procesos...`);
+
+        // 1. saveRun + procesos
+        await sb.saveRun(runId, payloadForJson);
+
+        // 2. subir PDFs descargados a Storage
+        let uploaded = 0;
+        for (const [nidProceso, info] of buffers.entries()) {
+          try {
+            const { path: storagePath } = await uploadBases({
+              nidProceso,
+              filename: info.filename,
+              buffer: info.buffer,
+            });
+            const hash = createHash("sha256").update(info.buffer).digest("hex");
+            await sb.saveDocumento({
+              nidProceso,
+              filename: info.filename,
+              tipo: info.tipo,
+              sizeBytes: info.size,
+              storagePath,
+              hashSha256: hash,
+            });
+            uploaded++;
+          } catch (e) {
+            console.warn(`[supabase] upload fail ${nidProceso}: ${e.message}`);
+          }
+        }
+        console.log(
+          `[supabase] OK: 1 run, ${payloadForJson.procesos?.length || 0} procesos, ${uploaded} PDFs`
+        );
+      } catch (e) {
+        console.error(`[supabase] FAIL: ${e.message}`);
+      }
+    }
     console.log(`\nResumen:`);
     console.log(`   Listados:           ${payload.resumen.totalListados}`);
     console.log(`   Pre-filtro pasaron: ${payload.resumen.preFiltroPasaron}/${payload.resumen.limit} (descartados: ${payload.resumen.descartadosPrefiltro})`);
