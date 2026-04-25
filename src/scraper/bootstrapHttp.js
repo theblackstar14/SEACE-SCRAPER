@@ -49,7 +49,131 @@ async function captureViewState(page) {
 }
 
 /**
+ * BATCH-POR-PAGINA: pagina el listado y para CADA página, invoca un callback
+ * con las rows de esa página ANTES de paginar a la siguiente.
+ *
+ * Esto resuelve el bug de view tree state: los button IDs son válidos solo
+ * mientras la página correspondiente está visible. Si paginás más, el server
+ * pierde referencia.
+ *
+ * @param {object} opts
+ *   - filters: filtros buscador
+ *   - onPageRows: async (rowsOfThisPage, session, pageIdx) => any
+ *     callback ejecutado con las rows de cada página. Bloquea la paginación
+ *     hasta que termina (await).
+ *   - maxPages: cota
+ */
+export async function bootstrapBatchByPage({ filters = {}, onPageRows, maxPages = 50 } = {}) {
+  resetSession();
+  const session = getSession();
+
+  return withPage(async (page) => {
+    const t0 = Date.now();
+    await openBuscador(page, filters);
+
+    const vs = await captureViewState(page);
+    if (!vs) throw new Error("No se pudo capturar ViewState");
+    session.setViewState(vs);
+
+    const cookies = await page.context().cookies();
+    await session.importPlaywrightCookies(cookies);
+
+    let pageIdx = 0;
+    let totalRows = 0;
+    const allRows = [];
+
+    while (pageIdx < maxPages) {
+      const rowsData = await page.$$eval(
+        "#tbBuscador\\:idFormBuscarProceso\\:dtProcesos tbody tr[data-ri]",
+        (trs) => {
+          return trs.map((tr) => {
+            const cells = tr.querySelectorAll("td");
+            const cellTxt = (i) => (cells[i]?.innerText || "").trim();
+            const fichaA = tr.querySelector("a:has(img[src*='fichaSeleccion'])") ||
+                           [...tr.querySelectorAll("a[onclick]")].find((a) =>
+                             (a.getAttribute("onclick") || "").includes("nidProceso") &&
+                             !(a.getAttribute("onclick") || "").includes("frmListaCodigoSnip")
+                           );
+            const onclick = fichaA?.getAttribute("onclick") || "";
+            const btnIdMatch = onclick.match(/'(tbBuscador:idFormBuscarProceso:dtProcesos:\d+:j_idt\d+)'/);
+            const procMatch = onclick.match(/'nidProceso'\s*:\s*'([^']+)'/);
+            const convMatch = onclick.match(/'nidConvocatoria'\s*:\s*'([^']+)'/);
+            return {
+              nro: cellTxt(0),
+              entidad: cellTxt(1),
+              fechaPublicacion: cellTxt(2),
+              nomenclatura: cellTxt(3),
+              reiniciadoDesde: cellTxt(4),
+              objetoContratacion: cellTxt(5),
+              descripcion: cellTxt(6),
+              vrCuantiaRaw: cellTxt(9),
+              moneda: cellTxt(10),
+              versionSeace: cellTxt(11),
+              buttonId: btnIdMatch?.[1] || null,
+              nidProceso: procMatch?.[1] || null,
+              nidConvocatoria: convMatch?.[1] || null,
+            };
+          });
+        }
+      );
+
+      // parse VR a number
+      for (const r of rowsData) {
+        const cleanVR = String(r.vrCuantiaRaw || "").replace(/[^\d.,-]/g, "");
+        if (cleanVR && cleanVR !== "---") {
+          const decimal = cleanVR.match(/[.,]\d{1,2}$/) ? "." + cleanVR.slice(-2) : "";
+          const intStr = decimal ? cleanVR.slice(0, -3) : cleanVR;
+          const num = Number(intStr.replace(/[^\d]/g, "") + decimal);
+          r.vrCuantia = Number.isFinite(num) ? num : null;
+        } else {
+          r.vrCuantia = null;
+        }
+        delete r.vrCuantiaRaw;
+      }
+
+      console.log(`[bootstrap-batch] página ${pageIdx + 1}: ${rowsData.length} rows`);
+      totalRows += rowsData.length;
+      allRows.push(...rowsData);
+
+      // CALLBACK: procesa estas rows ANTES de paginar
+      // (los button IDs solo son válidos mientras esta página está visible)
+      if (onPageRows) {
+        await onPageRows(rowsData, session, pageIdx);
+      }
+
+      // siguiente página
+      const next = await page.$(SEL.paginatorNext);
+      if (!next) break;
+
+      const respPromise = page
+        .waitForResponse(
+          (r) => r.url().includes("buscadorPublico") && r.request().method() === "POST",
+          { timeout: 25_000 }
+        )
+        .catch(() => null);
+      await next.click();
+      await respPromise;
+
+      // re-capturar ViewState
+      const newVs = await captureViewState(page);
+      if (newVs) session.setViewState(newVs);
+
+      // re-importar cookies (pueden haber rotado)
+      const newCookies = await page.context().cookies();
+      await session.importPlaywrightCookies(newCookies);
+
+      pageIdx++;
+    }
+
+    console.log(`[bootstrap-batch] total ${totalRows} rows en ${Date.now() - t0}ms (${pageIdx + 1} pages)`);
+    return { session, totalRows, pages: pageIdx + 1, allRows };
+  });
+}
+
+/**
  * Bootstrap: abre buscador con filtros, captura cookies + ViewState + button IDs.
+ * Versión OLD que pagina todo y captura en memoria. NO usar para HTTP fetch
+ * porque los button IDs ya no son válidos tras paginar (use bootstrapBatchByPage).
  *
  * @returns {{ session: SeaceHttpSession, listado: Array, totalCapturados: number }}
  */

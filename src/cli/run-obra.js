@@ -11,6 +11,7 @@
  */
 import fs from "node:fs/promises";
 import { runObraPipeline } from "../pipeline/orchestrator.js";
+import { runObraPipelineHttp } from "../pipeline/orchestratorHttp.js";
 import { createJsonStore } from "../store/jsonStore.js";
 import { formatSeaceDate } from "../scraper/common.js";
 import { shutdownBrowser } from "../browserPool.js";
@@ -38,6 +39,7 @@ function parseArgs(argv) {
     else if (a === "--max-monto-ratio") args.maxMontoRatio = Number(next), i++;
     else if (a === "--max-pub-dias") args.maxPubDias = Number(next), i++;
     else if (a === "--max-doc-mb") args.maxDocMB = Number(next), i++;
+    else if (a === "--http") args.useHttp = true;
     else if (a === "--help" || a === "-h") {
       console.log(
         `Usage: node src/cli/run-obra.js [opts]\n` +
@@ -58,7 +60,8 @@ function parseArgs(argv) {
           `  --min-dias N       días mínimos antes de presentación (default 15)\n` +
           `  --max-monto-ratio  VR <= empresa.capacidad × N (default 2)\n` +
           `  --max-pub-dias N   descarta si pubFecha > N días (default 30)\n` +
-          `  --max-doc-mb N     skip download si Bases > N MB (default 50)\n`
+          `  --max-doc-mb N     skip download si Bases > N MB (default 50)\n` +
+          `  --http             usa pipeline HTTP directo (10x mas rapido, experimental)\n`
       );
       process.exit(0);
     }
@@ -109,6 +112,7 @@ async function main() {
   console.log(`   Empresa:  ${empresa.razonSocial} (RUC ${empresa.ruc})`);
   console.log(`   Rango:    ${fechaDesde} -> ${fechaHasta}`);
   console.log(`   Limite:   ${args.limit} procesos`);
+  console.log(`   Pipeline: ${args.useHttp ? "HTTP DIRECTO (rapido)" : "Playwright (clasico)"}`);
   console.log(`   SkipPDF:  ${!!args.skipPdf}`);
   console.log(`   LLM:      ${providerLabel} (${llmPolicy})`);
   console.log(`   Filtros:  >=${minDias}d antes presentacion | VR <= ${maxMontoRatio}x capacidad | pubFecha <= ${maxPubDias}d | doc <= ${maxDocMB}MB\n`);
@@ -117,7 +121,8 @@ async function main() {
   const runId = store.newRunId();
 
   try {
-    const payload = await runObraPipeline({
+    const runFn = args.useHttp ? runObraPipelineHttp : runObraPipeline;
+    const payload = await runFn({
       empresa,
       filters: {
         objetoContratacion: "Obra",
