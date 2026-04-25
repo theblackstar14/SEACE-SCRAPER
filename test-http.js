@@ -56,22 +56,17 @@ try {
       const elapsed = Date.now() - tHttp;
       if (result._error) {
         console.log(`  FAIL en ${elapsed}ms: ${result._error}, htmlSize=${result._htmlSize}`);
-        // dump primer response para inspeccionar
-        if (sample.indexOf(r) === 0) {
-          await fs.mkdir("./data/debug", { recursive: true });
-          const { html } = await postFichaForm({
-            buttonId: r.buttonId,
-            nidProceso: r.nidProceso,
-            nidConvocatoria: r.nidConvocatoria,
-          });
-          await fs.writeFile("./data/debug/http-response.html", html, "utf8");
-          console.log(`  HTML guardado: ./data/debug/http-response.html (${html.length} chars)`);
-          // primeros 500 chars del body
-          const bodyStart = html.indexOf("<body");
-          if (bodyStart >= 0) {
-            console.log(`  body inicio:`, html.slice(bodyStart, bodyStart + 400).replace(/\s+/g, " "));
-          }
-        }
+        // siempre dumpea response cuando falla
+        await fs.mkdir("./data/debug", { recursive: true });
+        const { html, status } = await postFichaForm({
+          buttonId: r.buttonId,
+          nidProceso: r.nidProceso,
+          nidConvocatoria: r.nidConvocatoria,
+        });
+        const file = `./data/debug/http-fail-${sample.indexOf(r)}.html`;
+        await fs.writeFile(file, html, "utf8");
+        console.log(`  HTML status=${status} guardado: ${file} (${html.length} chars)`);
+        if (html.length < 5000) console.log(`  body completo:`, html.replace(/\s+/g, " "));
       } else {
         console.log(`  OK en ${elapsed}ms`);
         console.log(`    cronograma items: ${result.cronograma.length}`);

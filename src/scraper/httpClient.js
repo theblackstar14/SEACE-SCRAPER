@@ -162,11 +162,9 @@ export class SeaceHttpSession {
 
     const html = await respBody.text();
 
-    // capturar nuevo ViewState si aparece (JSF lo rota a veces)
-    const vsMatch = html.match(/name="javax\.faces\.ViewState"[^>]*value="([^"]+)"/);
-    if (vsMatch && vsMatch[1] !== this.viewState) {
-      this.viewState = vsMatch[1];
-    }
+    // NO rotamos ViewState aquí: el response viene de la vista FICHA, pero
+    // los siguientes POSTs son submits desde la vista LISTADO original.
+    // Mantenemos el ViewState del listado capturado en bootstrap.
 
     return { html, status: statusCode, headers };
   }
