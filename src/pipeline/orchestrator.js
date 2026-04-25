@@ -157,7 +157,11 @@ async function findLargestPdfRecursive(zip, depth = 0) {
  * Ej: monto muy bajo (< 1% VR) o muy alto (> 20× VR) es probable error.
  */
 function detectarMontoAbsurdo(monto, vr) {
-  if (!monto || !vr) return null;
+  if (!monto) return null;
+  if (!vr) {
+    // sin VR no podemos validar magnitud relativa. Ser defensivo.
+    return `monto S/ ${monto.toLocaleString("es-PE")} extraído sin VR de referencia — requiere validación manual`;
+  }
   if (monto === vr || Math.abs(monto - vr) / vr < 0.02) {
     return `monto extraído (${monto}) coincide con VR (${vr}) ±2% — probable falso positivo`;
   }
