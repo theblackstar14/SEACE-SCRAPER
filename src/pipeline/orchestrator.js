@@ -78,6 +78,52 @@ async function dumpText(nomenclatura, text, meta) {
 }
 
 /**
+ * Intenta LLM primero con `provider` preferido. Si falla por rate-limit, créditos
+ * agotados, 429, o cualquier error → cae atrás al OTRO provider disponible.
+ * Retorna { result, providerUsed, errors: [{ provider, error }] }.
+ *
+ * @param {object} opts
+ *   - preferredProvider: "claude" | "gemini"
+ *   - callClaude: async () => result
+ *   - callGemini: async () => result
+ */
+async function tryLlmWithFallback({ preferredProvider, callClaude, callGemini }) {
+  const { isLlmAvailable } = await import("../llm/claude.js");
+  const { isGeminiAvailable } = await import("../llm/gemini.js");
+
+  const errors = [];
+  const order = [];
+  if (preferredProvider === "gemini" && isGeminiAvailable()) {
+    order.push({ name: "gemini", fn: callGemini });
+    if (isLlmAvailable()) order.push({ name: "claude", fn: callClaude });
+  } else if (preferredProvider === "claude" && isLlmAvailable()) {
+    order.push({ name: "claude", fn: callClaude });
+    if (isGeminiAvailable()) order.push({ name: "gemini", fn: callGemini });
+  } else {
+    // auto: el que esté
+    if (isLlmAvailable()) order.push({ name: "claude", fn: callClaude });
+    if (isGeminiAvailable()) order.push({ name: "gemini", fn: callGemini });
+  }
+
+  for (const { name, fn } of order) {
+    try {
+      const result = await fn();
+      return { result, providerUsed: name, errors };
+    } catch (e) {
+      const msg = String(e.message || e);
+      const depleted = /credits.*depleted|quota|insufficient|billing/i.test(msg);
+      const rateLimit = /429|rate.?limit|too many/i.test(msg);
+      console.warn(`[llm ${name} FAIL] ${msg.slice(0, 200)}`);
+      errors.push({ provider: name, error: msg.slice(0, 300), fatal: depleted });
+      // si el error es creds/billing, NO reintentar con mismo provider luego
+      // pero sí con el otro (próxima iteración del loop)
+    }
+  }
+
+  return { result: null, providerUsed: null, errors };
+}
+
+/**
  * Busca el PDF más grande dentro de un ZIP (recursivo a ZIPs anidados).
  * Retorna el Buffer o null.
  */
@@ -332,35 +378,33 @@ export async function runObraPipeline({
 
       // CASO ESPECIAL: escaneado Y LLM disponible → OCR directo sobre el PDF
       if (analisis.calidadTexto.escaneado && useLlm && pdfForOcr) {
-        try {
-          // para escaneados GRANDES preferimos Gemini (1M context, OCR mejor)
-          const provider = pickLlmProvider({
-            tipo: "pdf",
-            escaneado: true,
-            pageCount: doc.meta?.pages || 0,
-            llmProvider,
-          });
-          emit("llm", { msg: `${p.nomenclatura} → ${provider} OCR (escaneado)` });
-          const vr = detalle.vrCuantiaMonto || p.vrCuantia;
-          const llm =
-            provider === "gemini"
-              ? await extractRequisitosWithGeminiPdf(pdfForOcr, {
-                  valorReferencial: vr,
-                  filename: descarga.filename,
-                })
-              : await extractRequisitosWithClaudePdf(pdfForOcr, {
-                  valorReferencial: vr,
-                  filename: descarga.filename,
-                });
-          analisis.requisitos = mapLlmToRequisitos(llm, { fuente: `${provider}-pdf-ocr` });
-          analisis.llmUsed = { via: `${provider}-pdf-ocr`, provider, ...llm.meta };
+        const preferred = pickLlmProvider({
+          tipo: "pdf",
+          escaneado: true,
+          pageCount: doc.meta?.pages || 0,
+          llmProvider,
+        });
+        const vr = detalle.vrCuantiaMonto || p.vrCuantia;
+        emit("llm", { msg: `${p.nomenclatura} → ${preferred} OCR (escaneado) [con fallback]` });
+
+        const { result: llm, providerUsed, errors } = await tryLlmWithFallback({
+          preferredProvider: preferred,
+          callClaude: () => extractRequisitosWithClaudePdf(pdfForOcr, { valorReferencial: vr, filename: descarga.filename }),
+          callGemini: () => extractRequisitosWithGeminiPdf(pdfForOcr, { valorReferencial: vr, filename: descarga.filename }),
+        });
+
+        errors.forEach((e) => analisis.warnings.push(`${e.provider} fail: ${e.error}`));
+
+        if (llm) {
+          analisis.requisitos = mapLlmToRequisitos(llm, { fuente: `${providerUsed}-pdf-ocr` });
+          analisis.llmUsed = { via: `${providerUsed}-pdf-ocr`, provider: providerUsed, ...llm.meta };
           if (!llm.esBasesIntegradas || llm.confianza < 0.3 || llm.experienciaMonto == null) {
             analisis.evaluacion = {
               resultado: "indeterminado",
               razones: [
                 llm.esBasesIntegradas
-                  ? `Claude analizó el PDF pero no detectó monto específico de experiencia (confianza ${llm.confianza.toFixed(2)}). ${llm.notas || ""}`
-                  : `Claude identificó Bases Estándar sin rellenar (etapa temprana). ${llm.notas || ""}`,
+                  ? `${providerUsed} analizó el PDF pero no detectó monto específico (confianza ${llm.confianza.toFixed(2)}). ${llm.notas || ""}`
+                  : `${providerUsed} identificó Bases Estándar sin rellenar (etapa temprana). ${llm.notas || ""}`,
               ],
             };
           } else {
@@ -370,14 +414,13 @@ export async function runObraPipeline({
               { consorcioRatio: 0.5 }
             );
             analisis.evaluacion.razones.unshift(
-              `Extracción por ${provider} (PDF escaneado, OCR): confianza ${llm.confianza.toFixed(2)}`
+              `Extracción por ${providerUsed} (PDF escaneado, OCR): confianza ${llm.confianza.toFixed(2)}`
             );
           }
           enriquecidos.push({ listado: p, detalle, analisis });
           continue;
-        } catch (e) {
-          analisis.warnings.push(`claude OCR fail: ${e.message}`);
         }
+        // ambos LLM fallaron — cae a la rama "No se pudo extraer texto" de abajo
       }
 
       if (!analisis.textoExtraido || analisis.calidadTexto.escaneado) {
@@ -459,7 +502,7 @@ export async function runObraPipeline({
           const vr = detalle.vrCuantiaMonto || p.vrCuantia;
           const textOk = doc.text && doc.text.length > 500;
 
-          const provider = pickLlmProvider({
+          const preferred = pickLlmProvider({
             tipo: textOk ? "text" : "pdf",
             escaneado: false,
             pageCount: doc.meta?.pages || 0,
@@ -468,22 +511,26 @@ export async function runObraPipeline({
           });
           const reason = regexFallo ? "regex fallo" : regexSospechoso ? "sospecha" : esTemplate ? "template" : "reforzar";
           emit("llm", {
-            msg: `${p.nomenclatura} → ${provider} ${textOk ? "text" : "pdf"} (${reason})`,
+            msg: `${p.nomenclatura} → ${preferred} ${textOk ? "text" : "pdf"} (${reason}) [con fallback]`,
           });
 
-          const llm = textOk
-            ? provider === "gemini"
-              ? await extractRequisitosWithGeminiText(doc.text, { valorReferencial: vr })
-              : await extractRequisitosWithClaudeText(doc.text, { valorReferencial: vr })
-            : provider === "gemini"
-            ? await extractRequisitosWithGeminiPdf(descarga.buffer, {
-                valorReferencial: vr,
-                filename: descarga.filename,
-              })
-            : await extractRequisitosWithClaudePdf(descarga.buffer, {
-                valorReferencial: vr,
-                filename: descarga.filename,
-              });
+          const { result: llm, providerUsed: provider, errors: llmErrors } = await tryLlmWithFallback({
+            preferredProvider: preferred,
+            callClaude: () =>
+              textOk
+                ? extractRequisitosWithClaudeText(doc.text, { valorReferencial: vr })
+                : extractRequisitosWithClaudePdf(descarga.buffer, { valorReferencial: vr, filename: descarga.filename }),
+            callGemini: () =>
+              textOk
+                ? extractRequisitosWithGeminiText(doc.text, { valorReferencial: vr })
+                : extractRequisitosWithGeminiPdf(descarga.buffer, { valorReferencial: vr, filename: descarga.filename }),
+          });
+
+          llmErrors.forEach((e) => analisis.warnings.push(`${e.provider} fail: ${e.error}`));
+
+          if (!llm) {
+            throw new Error(`todos los LLM fallaron (${llmErrors.map((e) => e.provider).join(", ")})`);
+          }
 
           analisis.llmUsed = {
             via: `${provider}-${textOk ? "text" : "pdf"}`,
