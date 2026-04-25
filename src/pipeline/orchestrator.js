@@ -509,8 +509,18 @@ export async function runObraPipeline({
       analisis.requisitos = cached.requisitos;
       analisis.calidadTexto = cached.calidadTexto;
       analisis.zipContents = cached.zipContents || null;
-      // re-evaluar contra empresa (puede haber cambiado entre runs)
-      if (cached.requisitos?.experienciaMonto) {
+
+      // re-aplicar sanity check (no se persiste en cache, depende del VR del proceso actual)
+      const vrActual = detalle.vrCuantiaMonto || p.vrCuantia;
+      const cachedSospecha = detectarMontoAbsurdo(cached.requisitos?.experienciaMonto, vrActual);
+
+      if (cachedSospecha) {
+        analisis.evaluacion = {
+          resultado: "indeterminado",
+          razones: [`📦 Cache hit + sospecha: ${cachedSospecha}`],
+        };
+        analisis.warnings.push(`cache-sospecha: ${cachedSospecha}`);
+      } else if (cached.requisitos?.experienciaMonto) {
         analisis.evaluacion = evaluarProceso(
           {
             experienciaMonto: cached.requisitos.experienciaMonto,
