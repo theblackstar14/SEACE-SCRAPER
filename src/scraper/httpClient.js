@@ -80,7 +80,9 @@ export class SeaceHttpSession {
 
     const cookieStr = await this.cookieHeader();
 
-    const { statusCode, headers, body: respBody } = await this.pool.request({
+    // POST inicial. JSF responde 302 con Location → seguimos redirect manual
+    // (undici Pool no sigue redirects automáticamente)
+    const initial = await this.pool.request({
       path: FORM_PATH,
       method: "POST",
       headers: {
@@ -92,12 +94,60 @@ export class SeaceHttpSession {
         "Cookie": cookieStr,
         "Referer": SEACE_HOST + FORM_PATH,
         "Origin": SEACE_HOST,
-        "X-Requested-With": "XMLHttpRequest", // a veces JSF lo espera
       },
       body: body.toString(),
       bodyTimeout: 60_000,
       headersTimeout: 30_000,
     });
+
+    let { statusCode, headers, body: respBody } = initial;
+
+    // capturar Set-Cookie del POST inicial
+    const captureSetCookie = async (h) => {
+      const sc = h["set-cookie"];
+      if (!sc) return;
+      const arr = Array.isArray(sc) ? sc : [sc];
+      for (const cookie of arr) {
+        try { await this.cookies.setCookie(cookie, SEACE_HOST + FORM_PATH); } catch {}
+      }
+    };
+    await captureSetCookie(headers);
+
+    // seguir redirects (302 → GET a Location)
+    let redirectsLeft = 5;
+    while (statusCode >= 300 && statusCode < 400 && redirectsLeft > 0) {
+      // drenar body actual
+      try { await respBody.text(); } catch {}
+
+      const loc = headers.location || headers.Location;
+      if (!loc) break;
+
+      // path absoluto o relativo
+      const redirectPath = loc.startsWith("http")
+        ? loc.replace(SEACE_HOST, "")
+        : loc.startsWith("/") ? loc : "/seacebus-uiwd-pub/buscadorPublico/" + loc;
+
+      const cookieStr2 = await this.cookieHeader();
+      const next = await this.pool.request({
+        path: redirectPath,
+        method: "GET",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "es-PE,es;q=0.9",
+          "Cookie": cookieStr2,
+          "Referer": SEACE_HOST + FORM_PATH,
+        },
+        bodyTimeout: 60_000,
+        headersTimeout: 30_000,
+      });
+      statusCode = next.statusCode;
+      headers = next.headers;
+      respBody = next.body;
+      await captureSetCookie(headers);
+      redirectsLeft--;
+    }
 
     // capturar nuevas cookies del Set-Cookie
     const setCookies = headers["set-cookie"];
