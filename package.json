@@ -25,6 +25,8 @@
     "mammoth": "^1.8.0",
     "node-unrar-js": "^2.0.2",
     "p-limit": "^6.1.0",
+    "tough-cookie": "^5.0.0",
+    "undici": "^7.1.1",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "playwright": "^1.59.1",
