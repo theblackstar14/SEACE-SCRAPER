@@ -34,6 +34,10 @@ function parseArgs(argv) {
     else if (a === "--llm-always") args.llmAlways = true;
     else if (a === "--prefer-claude") args.llmProvider = "claude";
     else if (a === "--prefer-gemini") args.llmProvider = "gemini";
+    else if (a === "--min-dias") args.minDias = Number(next), i++;
+    else if (a === "--max-monto-ratio") args.maxMontoRatio = Number(next), i++;
+    else if (a === "--max-pub-dias") args.maxPubDias = Number(next), i++;
+    else if (a === "--max-doc-mb") args.maxDocMB = Number(next), i++;
     else if (a === "--help" || a === "-h") {
       console.log(
         `Usage: node src/cli/run-obra.js [opts]\n` +
@@ -50,7 +54,11 @@ function parseArgs(argv) {
           `  --no-llm           desactiva LLM aunque haya keys configuradas\n` +
           `  --llm-always       usa LLM para TODOS los procesos (no solo fallback)\n` +
           `  --prefer-claude    fuerza usar Claude (si hay key)\n` +
-          `  --prefer-gemini    fuerza usar Gemini (si hay key)\n`
+          `  --prefer-gemini    fuerza usar Gemini (si hay key)\n` +
+          `  --min-dias N       días mínimos antes de presentación (default 15)\n` +
+          `  --max-monto-ratio  VR <= empresa.capacidad × N (default 2)\n` +
+          `  --max-pub-dias N   descarta si pubFecha > N días (default 30)\n` +
+          `  --max-doc-mb N     skip download si Bases > N MB (default 50)\n`
       );
       process.exit(0);
     }
@@ -92,12 +100,18 @@ async function main() {
       ? `✨ ON auto [${[claudeKey && "claude", geminiKey && "gemini"].filter(Boolean).join("+")}]`
       : `✨ ON forced ${llmProvider}`;
 
+  const minDias = args.minDias ?? 15;
+  const maxMontoRatio = args.maxMontoRatio ?? 2;
+  const maxPubDias = args.maxPubDias ?? 30;
+  const maxDocMB = args.maxDocMB ?? 50;
+
   console.log(`\n🏗️  SEACE Obra Pipeline`);
   console.log(`   Empresa:  ${empresa.razonSocial} (RUC ${empresa.ruc})`);
   console.log(`   Rango:    ${fechaDesde} → ${fechaHasta}`);
   console.log(`   Límite:   ${args.limit} procesos`);
   console.log(`   SkipPDF:  ${!!args.skipPdf}`);
-  console.log(`   LLM:      ${providerLabel} (${llmPolicy})\n`);
+  console.log(`   LLM:      ${providerLabel} (${llmPolicy})`);
+  console.log(`   Filtros:  >=${minDias}d antes presentación · VR <= ${maxMontoRatio}× capacidad · pubFecha <= ${maxPubDias}d · doc <= ${maxDocMB}MB\n`);
 
   const store = createJsonStore(args.out);
   const runId = store.newRunId();
@@ -117,20 +131,27 @@ async function main() {
       useLlm,
       llmPolicy,
       llmProvider,
+      minDias,
+      maxMontoRatio,
+      maxPubDias,
+      maxDocMB,
     });
 
     const file = await store.saveRun(runId, payload);
     console.log(`\n✅ Guardado en: ${file}`);
     console.log(`\n📊 Resumen:`);
-    console.log(`   Listados:        ${payload.resumen.totalListados}`);
-    console.log(`   Analizados:      ${payload.resumen.analizados}`);
-    console.log(`   Activos:         ${payload.resumen.activos}`);
-    console.log(`   Califican:       ${payload.resumen.califican}`);
-    console.log(`   Consorcio:       ${payload.resumen.consorcio}`);
-    console.log(`   No califican:    ${payload.resumen.noCalifican}`);
-    console.log(`   Indeterminados:  ${payload.resumen.indeterminados}`);
-    console.log(`   Escaneados:      ${payload.resumen.escaneados}`);
-    console.log(`   Templates:       ${payload.resumen.templates}`);
+    console.log(`   Listados:           ${payload.resumen.totalListados}`);
+    console.log(`   Pre-filtro pasaron: ${payload.resumen.preFiltroPasaron}/${payload.resumen.limit} (descartados: ${payload.resumen.descartadosPrefiltro})`);
+    console.log(`   Cronogramas leídos: ${payload.resumen.cronogramasLeidos}`);
+    console.log(`   Tiempo suficiente:  ${payload.resumen.conTiempoSuficiente}`);
+    console.log(`   Detalle completo:   ${payload.resumen.detalleCompleto}`);
+    console.log(`   ─────────────────────`);
+    console.log(`   ✅ Califican:        ${payload.resumen.califican}`);
+    console.log(`   🤝 Consorcio:        ${payload.resumen.consorcio}`);
+    console.log(`   ❌ No califican:     ${payload.resumen.noCalifican}`);
+    console.log(`   ❓ Indeterminados:   ${payload.resumen.indeterminados}`);
+    console.log(`      escaneados:      ${payload.resumen.escaneados}`);
+    console.log(`      templates:       ${payload.resumen.templates}`);
     if (payload.resumen.llmEnabled) {
       const byProvider = payload.procesos
         .filter((p) => p.llmUsed?.provider)
@@ -139,9 +160,20 @@ async function main() {
           return acc;
         }, {});
       const breakdown = Object.entries(byProvider).map(([k, v]) => `${k}:${v}`).join(", ");
-      console.log(`   ✨ LLM:           ${payload.resumen.llmUsed} procesos${breakdown ? ` (${breakdown})` : ""}`);
+      console.log(`   ✨ LLM:              ${payload.resumen.llmUsed} procesos${breakdown ? ` (${breakdown})` : ""}`);
     }
-    console.log(`   Duración:        ${(payload.resumen.duracionMs / 1000).toFixed(1)}s`);
+    console.log(`   Duración:           ${(payload.resumen.duracionMs / 1000).toFixed(1)}s`);
+
+    // Top 5 procesos por score
+    const top = payload.procesos.slice(0, 5);
+    if (top.length) {
+      console.log(`\n🏆 Top ${top.length} por score:`);
+      top.forEach((p, i) => {
+        const result = p.evaluacion.resultado.padEnd(15);
+        const score = String(p.score || 0).padStart(3);
+        console.log(`   ${i + 1}. [${score}] ${result} ${p.nomenclatura} (${p.diasRestantes ?? "?"}d)`);
+      });
+    }
   } finally {
     await shutdownBrowser();
   }

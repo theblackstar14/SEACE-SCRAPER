@@ -113,6 +113,32 @@ export async function scrapeDetalle({ nomenclatura, nidProceso, nidConvocatoria,
 }
 
 /**
+ * VERSIÓN LIGERA: solo lee cronograma + fechaPresentacion. NO parsea labels,
+ * NO descarga, NO extrae documentos. Para pre-filtrado rápido.
+ *
+ * Tiempo típico: ~30s (la mayoría es openBuscador navigation, irreducible
+ * sin HTTP directo).
+ *
+ * Útil para: descartar procesos vencidos o sin tiempo de postular ANTES
+ * de gastar bandwidth/LLM en su análisis completo.
+ */
+export async function scrapeCronogramaOnly({ nomenclatura, nidProceso, nidConvocatoria, filters }) {
+  return withPage(async (page) => {
+    const t0 = Date.now();
+    await navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters });
+    const html = await page.content();
+    const $ = cheerio.load(html);
+    const cronograma = extractCronograma($);
+    const fechaPresentacion = findFechaPresentacion(cronograma);
+    console.log(
+      `[cronograma] ${nomenclatura || nidProceso} en ${Date.now() - t0}ms — ` +
+        `presentación: ${fechaPresentacion?.estado || "?"} (${fechaPresentacion?.fin || "s/f"})`
+    );
+    return { cronograma, fechaPresentacion };
+  });
+}
+
+/**
  * Parsea el HTML de una ficha ya abierta en `page` y retorna data estructurada.
  * Extraído de scrapeDetalle para reuso.
  */
@@ -254,22 +280,49 @@ export async function scrapeDetalleConDescarga({
       docSelected = selectBasesIntegradas(detalle.documentos);
       if (docSelected.doc && docSelected.doc.descargas.length) {
         const targetFilename = docSelected.doc.descargas[0].filename;
-        try {
-          const tDl = Date.now();
-          descarga = await downloadFromPage(page, targetFilename);
-          const tipo = (descarga.filename.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
-          descarga.tipo = tipo;
-          console.log(
-            `[descarga] ${nomenclatura}: ${descarga.filename} ${Math.round(descarga.size / 1024)}KB en ${Date.now() - tDl}ms`
+
+        // skip por tamaño si excede maxDocMB (lee de meta sizeText "(N KB)")
+        const maxDocMB = filters?.maxDocMB ?? 50;
+        const sizeMB = parseSizeMB(docSelected.doc.sizeText);
+        if (sizeMB && sizeMB > maxDocMB) {
+          console.warn(
+            `[descarga SKIP] ${nomenclatura}: ${targetFilename} ${sizeMB}MB > limit ${maxDocMB}MB`
           );
-        } catch (e) {
-          console.warn(`[descarga FAIL] ${nomenclatura}: ${e.message}`);
+          docSelected.skipped = true;
+          docSelected.skipReason = `archivo ${sizeMB}MB > ${maxDocMB}MB`;
+        } else {
+          try {
+            const tDl = Date.now();
+            descarga = await downloadFromPage(page, targetFilename);
+            const tipo = (descarga.filename.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+            descarga.tipo = tipo;
+            console.log(
+              `[descarga] ${nomenclatura}: ${descarga.filename} ${Math.round(descarga.size / 1024)}KB en ${Date.now() - tDl}ms`
+            );
+          } catch (e) {
+            console.warn(`[descarga FAIL] ${nomenclatura}: ${e.message}`);
+          }
         }
       }
     }
 
     return { detalle, descarga, docSelected };
   });
+}
+
+/**
+ * Parsea sizeText tipo "(5884 KB)" → MB number, o null si no parsea.
+ */
+function parseSizeMB(sizeText) {
+  if (!sizeText) return null;
+  const m = String(sizeText).match(/\(([\d.,]+)\s*([KMG]?B)\)/i);
+  if (!m) return null;
+  const num = parseFloat(m[1].replace(",", "."));
+  const unit = m[2].toUpperCase();
+  if (unit === "KB") return num / 1024;
+  if (unit === "MB") return num;
+  if (unit === "GB") return num * 1024;
+  return num / 1024 / 1024; // bytes
 }
 
 export async function descargarDoc({ nomenclatura, nidProceso, nidConvocatoria, filename, filters }) {

@@ -2,8 +2,8 @@ import pLimit from "p-limit";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { scrapeSeace } from "../scraper/seaceScraper.js";
-import { scrapeDetalleConDescarga } from "../scraper/seaceDetalle.js";
-import { isProcesoActivo } from "../scraper/cronograma.js";
+import { scrapeDetalleConDescarga, scrapeCronogramaOnly } from "../scraper/seaceDetalle.js";
+import { isProcesoActivo, parseSeaceDate } from "../scraper/cronograma.js";
 import { extractTextFromDoc } from "../pdf/docExtractor.js";
 import { analizarRequisitos } from "../analyzer/requisitos.js";
 import { evaluarProceso } from "../analyzer/evaluator.js";
@@ -46,6 +46,88 @@ function pickLlmProvider({ tipo, pageCount, textLength, escaneado, llmProvider =
 
 const DEBUG_DIR = "./data/debug/pdftext";
 const DUMP_MAX_FILES = 20;
+
+const MS_DAY = 86_400_000;
+
+/**
+ * Pre-filtro 1: heurística por fecha publicación.
+ * Si proceso publicado hace mucho, probable que ya venció presentación.
+ * - LP-ABR (Licitación Pública Abreviada): ciclo ~25-30 días → skip si pubFecha > 30 días
+ * - LP / LP-SM regular: ciclo ~45-60 días → skip si pubFecha > 60 días
+ * - DIRECTA / RES-PROC: cortos, ~15 días → skip si pubFecha > 20 días
+ */
+function probablementeVencido(proceso, { maxPubDias = 30 } = {}) {
+  const pubFecha = parseSeaceDate(proceso.fechaPublicacion);
+  if (!pubFecha) return false; // si no parseamos, no descartamos
+  const diasDesdePub = (Date.now() - pubFecha.ms) / MS_DAY;
+
+  const nom = String(proceso.nomenclatura || "").toUpperCase();
+  let umbral = maxPubDias;
+  if (/LP-?ABR|LPABR/.test(nom)) umbral = Math.min(maxPubDias, 30);
+  else if (/^LP-|LP-SM|^CP-|^LICITACION/.test(nom)) umbral = Math.max(maxPubDias, 60);
+  else if (/DIRECTA|RES-PROC/.test(nom)) umbral = Math.min(maxPubDias, 20);
+
+  return diasDesdePub > umbral;
+}
+
+/**
+ * Pre-filtro 2: monto VR vs capacidad empresa.
+ * Si VR > capacidad × ratio, ni con consorcio cubrimos. Skip.
+ */
+function fueraDeCapacidad(proceso, empresa, { maxMontoRatio = 2 } = {}) {
+  const vr = proceso.vrCuantia;
+  const capacidad = empresa.capacidadContratacionCAPECO;
+  if (!vr || !capacidad) return false; // sin data, no descartamos
+  return vr > capacidad * maxMontoRatio;
+}
+
+/**
+ * Filtro real: tiene tiempo suficiente para postular.
+ * presentación >= hoy + N días.
+ */
+function tieneTiempoSuficiente(detalle, { minDias = 15 } = {}) {
+  const fp = detalle?.fechaPresentacion;
+  if (!fp) return false;
+  if (fp.estado === "vencido") return false;
+  if (fp.diasRestantes == null) return false;
+  return fp.diasRestantes >= minDias;
+}
+
+/**
+ * Score de priorización (0-100). Mayor = más interesante para el postor.
+ */
+function calcularScore(proceso, evaluacion, empresa, { minDias = 15 } = {}) {
+  let score = 0;
+
+  // (1) resultado evaluación: 40 pts max
+  const resMap = { califica: 40, consorcio: 25, no_califica: 5, indeterminado: 10 };
+  score += resMap[evaluacion?.resultado] ?? 0;
+
+  // (2) margen de tiempo: 25 pts max (más tiempo = mejor)
+  const dias = proceso.diasRestantes ?? 0;
+  if (dias >= 30) score += 25;
+  else if (dias >= 21) score += 20;
+  else if (dias >= minDias) score += 15;
+  else if (dias > 0) score += 5;
+
+  // (3) tipo obra coincide especialidades: 20 pts
+  const tipos = (proceso.requisitos?.tipoObra || "").split("|").filter(Boolean);
+  const especialidades = new Set((empresa.especialidades || []).map((s) => s.toLowerCase()));
+  const matches = tipos.filter((t) => especialidades.has(t.toLowerCase())).length;
+  if (matches >= 2) score += 20;
+  else if (matches === 1) score += 12;
+
+  // (4) confianza extracción: 10 pts max
+  score += Math.round((proceso.requisitos?.confianza ?? 0) * 10);
+
+  // (5) tamaño manejable: 5 pts (proceso < capacidad propia)
+  const vr = proceso.valorReferencial || 0;
+  if (vr > 0 && empresa.capacidadContratacionCAPECO && vr < empresa.capacidadContratacionCAPECO) {
+    score += 5;
+  }
+
+  return Math.min(100, Math.max(0, Math.round(score)));
+}
 
 async function dumpText(nomenclatura, text, meta) {
   try {
@@ -234,11 +316,23 @@ function analizarCalidadTexto(text, meta) {
 }
 
 /**
- * Pipeline:
- *   listar → detalle+descarga (1 nav) → filtro activos → extraer PDF → analizar → evaluar → output
+ * Pipeline 2-FASE optimizado:
  *
- * Cambio clave: detalle y descarga ahora comparten UNA sola navegación.
- * Antes: 2× openBuscador/proceso = ~60s desperdicio. Ahora: 1× = ~30s/proceso.
+ *   1. LISTADO (1.8 min)
+ *   2. PRE-FILTRO heurística (instantáneo): pubFecha vieja, monto > capacidad
+ *   3. CRONOGRAMA LIGERO (sin descarga, ~30s × N / concurrency)
+ *   4. FILTRO TIEMPO: presentación >= hoy + minDias
+ *   5. DETALLE COMPLETO + DESCARGA (skip > maxDocMB)
+ *   6. ANÁLISIS LLM (regex/Claude/Gemini)
+ *   7. SCORE + sorted output
+ *
+ * Beneficio: gastamos LLM/bandwidth solo en procesos accionables.
+ *
+ * @param {object} opts
+ *   - minDias: días mínimos antes de presentación (default 15)
+ *   - maxMontoRatio: VR <= empresa.capacidad × ratio (default 2)
+ *   - maxPubDias: descarta si pubFecha > N días (default 30, override por tipo)
+ *   - maxDocMB: skip download si Bases > N MB (default 50)
  */
 export async function runObraPipeline({
   empresa,
@@ -248,8 +342,12 @@ export async function runObraPipeline({
   onProgress = () => {},
   skipPdf = false,
   useLlm = isLlmAvailable() || isGeminiAvailable(),
-  llmPolicy = "fallback", // 'fallback' = solo si regex falla | 'always' = siempre
-  llmProvider = "auto", // 'auto' | 'claude' | 'gemini'
+  llmPolicy = "fallback",
+  llmProvider = "auto",
+  minDias = 15,
+  maxMontoRatio = 2,
+  maxPubDias = 30,
+  maxDocMB = 50,
 } = {}) {
   const runStart = Date.now();
   const emit = (step, data) => {
@@ -273,15 +371,60 @@ export async function runObraPipeline({
   });
   emit("listado_ok", { msg: `${listado.length} procesos en listado` });
 
-  const candidatos = listado.slice(0, limit);
+  // 2. PRE-FILTRO HEURÍSTICA (instantáneo, sin red)
+  const tras_prefiltro = listado
+    .slice(0, limit)
+    .filter((p) => {
+      if (probablementeVencido(p, { maxPubDias })) return false;
+      if (fueraDeCapacidad(p, empresa, { maxMontoRatio })) return false;
+      return true;
+    });
+  const descartadosPrefiltro = Math.min(limit, listado.length) - tras_prefiltro.length;
+  emit("prefiltro", {
+    msg: `${tras_prefiltro.length} pasaron pre-filtro (${descartadosPrefiltro} descartados por pubFecha/monto)`,
+  });
 
-  // 2. DETALLE + DESCARGA (una sola nav por proceso, concurrencia controlada)
+  // 3. CRONOGRAMA LIGERO — solo lee fechaPresentacion, no descarga
   const lim = pLimit(concurrency);
-  const detallados = await Promise.all(
-    candidatos.map((p, idx) =>
+  const cronogramas = await Promise.all(
+    tras_prefiltro.map((p, idx) =>
       lim(async () => {
         try {
-          emit("detalle", { idx, total: candidatos.length, msg: `${p.nomenclatura}` });
+          emit("cronograma", { idx, total: tras_prefiltro.length, msg: `${p.nomenclatura}` });
+          const { cronograma, fechaPresentacion } = await scrapeCronogramaOnly({
+            nomenclatura: p.nomenclatura,
+            nidProceso: p.nidProceso,
+            nidConvocatoria: p.nidConvocatoria,
+            filters: {
+              objetoContratacion: filters.objetoContratacion || "Obra",
+              fechaDesde: filters.fechaDesde,
+              fechaHasta: filters.fechaHasta,
+            },
+          });
+          return { listado: p, cronograma, fechaPresentacion, error: null };
+        } catch (e) {
+          console.warn(`[cronograma FAIL] ${p.nomenclatura}: ${e.message}`);
+          return { listado: p, error: e.message };
+        }
+      })
+    )
+  );
+
+  // 4. FILTRO TIEMPO SUFICIENTE (>= minDias hasta presentación)
+  const conTiempo = cronogramas.filter((c) =>
+    tieneTiempoSuficiente({ fechaPresentacion: c.fechaPresentacion }, { minDias })
+  );
+  emit("filtro_tiempo", {
+    msg: `${conTiempo.length}/${cronogramas.length} tienen >= ${minDias} días para presentación`,
+  });
+
+  // 5. DETALLE COMPLETO + DESCARGA — solo de los que pasaron filtros
+  const detallados = await Promise.all(
+    conTiempo.map((c, idx) =>
+      lim(async () => {
+        const p = c.listado;
+        try {
+          emit("detalle_full", { idx, total: conTiempo.length, msg: `${p.nomenclatura}` });
           const { detalle, descarga, docSelected } = await scrapeDetalleConDescarga({
             nomenclatura: p.nomenclatura,
             nidProceso: p.nidProceso,
@@ -290,6 +433,7 @@ export async function runObraPipeline({
               objetoContratacion: filters.objetoContratacion || "Obra",
               fechaDesde: filters.fechaDesde,
               fechaHasta: filters.fechaHasta,
+              maxDocMB,
             },
             downloadBases: !skipPdf,
           });
@@ -302,11 +446,9 @@ export async function runObraPipeline({
     )
   );
 
-  // 3. FILTRO ACTIVOS
-  const activos = detallados.filter((d) => d.detalle && isProcesoActivo(d.detalle.cronograma));
-  emit("filtro_activos", {
-    msg: `${activos.length} activos / ${detallados.filter((d) => d.detalle).length} detallados`,
-  });
+  // mantener "activos" como variable para compat con código posterior
+  const activos = detallados.filter((d) => d.detalle);
+  emit("detalle_ok", { msg: `${activos.length} detalles completos` });
 
   // 4. ANÁLISIS PDF + EVALUACIÓN (en memoria, sin red)
   const enriquecidos = [];
@@ -635,47 +777,56 @@ export async function runObraPipeline({
     enriquecidos.push({ listado: p, detalle, analisis });
   }
 
-  // 5. BUILD OUTPUT
-  const procesos = enriquecidos.map(({ listado: p, detalle, analisis }) => ({
-    id: p.nidProceso,
-    nidConvocatoria: p.nidConvocatoria,
-    nomenclatura: p.nomenclatura,
-    entidad: detalle.entidad || p.entidad,
-    descripcion: detalle.descripcion || p.descripcion,
-    objeto: detalle.objeto || p.objetoContratacion,
-    valorReferencial: detalle.vrCuantiaMonto ?? p.vrCuantia ?? null,
-    moneda: p.moneda || "PEN",
-    fechaPublicacion: detalle.fechaPublicacion || p.fechaPublicacion,
-    fechaPropuesta: detalle.fechaPresentacion?.finIso || detalle.fechaPresentacion?.fin || null,
-    diasRestantes: detalle.fechaPresentacion?.diasRestantes ?? null,
-    estado: detalle.fechaPresentacion?.estado,
-    cronograma: detalle.cronograma,
-    documentoUsado: analisis.documentoUsado,
-    zipContents: analisis.zipContents || null,
-    calidadTexto: analisis.calidadTexto, // { escaneado, template, razonCalidad }
-    llmUsed: analisis.llmUsed || null,
-    requisitos: analisis.requisitos
-      ? {
-          experienciaMinima: analisis.requisitos.experienciaMonto,
-          tipoObra: analisis.requisitos.tipoObra,
-          antiguedadMaxAnios: analisis.requisitos.antiguedadMaxAnios,
-          confianza: analisis.requisitos.experienciaConfianza,
-          requiereRevisionManual: analisis.requisitos.requiereLlm,
-        }
-      : null,
-    evaluacion: {
-      resultado: analisis.evaluacion?.resultado || "indeterminado",
-      razones: analisis.evaluacion?.razones || [],
-      sugerenciaConsorcio: analisis.evaluacion?.sugerenciaConsorcio || null,
-    },
-    warnings: analisis.warnings,
-  }));
+  // 7. BUILD OUTPUT con score y sort
+  const procesos = enriquecidos
+    .map(({ listado: p, detalle, analisis }) => {
+      const proceso = {
+        id: p.nidProceso,
+        nidConvocatoria: p.nidConvocatoria,
+        nomenclatura: p.nomenclatura,
+        entidad: detalle.entidad || p.entidad,
+        descripcion: detalle.descripcion || p.descripcion,
+        objeto: detalle.objeto || p.objetoContratacion,
+        valorReferencial: detalle.vrCuantiaMonto ?? p.vrCuantia ?? null,
+        moneda: p.moneda || "PEN",
+        fechaPublicacion: detalle.fechaPublicacion || p.fechaPublicacion,
+        fechaPropuesta: detalle.fechaPresentacion?.finIso || detalle.fechaPresentacion?.fin || null,
+        diasRestantes: detalle.fechaPresentacion?.diasRestantes ?? null,
+        estado: detalle.fechaPresentacion?.estado,
+        cronograma: detalle.cronograma,
+        documentoUsado: analisis.documentoUsado,
+        zipContents: analisis.zipContents || null,
+        calidadTexto: analisis.calidadTexto,
+        llmUsed: analisis.llmUsed || null,
+        requisitos: analisis.requisitos
+          ? {
+              experienciaMinima: analisis.requisitos.experienciaMonto,
+              tipoObra: analisis.requisitos.tipoObra,
+              antiguedadMaxAnios: analisis.requisitos.antiguedadMaxAnios,
+              confianza: analisis.requisitos.experienciaConfianza,
+              requiereRevisionManual: analisis.requisitos.requiereLlm,
+            }
+          : null,
+        evaluacion: {
+          resultado: analisis.evaluacion?.resultado || "indeterminado",
+          razones: analisis.evaluacion?.razones || [],
+          sugerenciaConsorcio: analisis.evaluacion?.sugerenciaConsorcio || null,
+        },
+        warnings: analisis.warnings,
+      };
+      proceso.score = calcularScore(proceso, proceso.evaluacion, empresa, { minDias });
+      return proceso;
+    })
+    .sort((a, b) => (b.score || 0) - (a.score || 0)); // mejor primero
 
   const resumen = {
     totalListados: listado.length,
-    analizados: candidatos.length,
-    detallados: detallados.filter((d) => d.detalle).length,
-    activos: activos.length,
+    limit,
+    preFiltroPasaron: tras_prefiltro.length,
+    descartadosPrefiltro,
+    cronogramasLeidos: cronogramas.filter((c) => c.fechaPresentacion).length,
+    conTiempoSuficiente: conTiempo.length,
+    detalleCompleto: activos.length,
     califican: procesos.filter((p) => p.evaluacion.resultado === "califica").length,
     consorcio: procesos.filter((p) => p.evaluacion.resultado === "consorcio").length,
     noCalifican: procesos.filter((p) => p.evaluacion.resultado === "no_califica").length,
@@ -684,6 +835,7 @@ export async function runObraPipeline({
     templates: procesos.filter((p) => p.calidadTexto?.template).length,
     llmUsed: procesos.filter((p) => p.llmUsed).length,
     llmEnabled: useLlm,
+    parametros: { minDias, maxMontoRatio, maxPubDias, maxDocMB },
     duracionMs: Date.now() - runStart,
   };
 
