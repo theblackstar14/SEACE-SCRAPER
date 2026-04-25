@@ -208,9 +208,9 @@ async function parseFichaFromPage(page, { nomenclatura, nidProceso } = {}) {
 
 /**
  * Descarga un documento específico de la ficha ya abierta (sin re-navegar).
- * Limpia el archivo temp de Playwright tras leer el buffer (evita llenar %TEMP%).
+ * Retry x3 con timeout 60s. Limpia temp post-lectura.
  */
-async function downloadFromPage(page, filename) {
+async function downloadFromPage(page, filename, { retries = 3 } = {}) {
   const dlAnchor = await page.evaluateHandle((fname) => {
     const anchors = document.querySelectorAll("a[onclick*='descargaDocGeneral']");
     for (const a of anchors) {
@@ -222,24 +222,35 @@ async function downloadFromPage(page, filename) {
   const el = dlAnchor.asElement();
   if (!el) throw new Error(`Archivo no encontrado en ficha: ${filename}`);
 
-  const [download] = await Promise.all([
-    page.waitForEvent("download", { timeout: T.download }),
-    el.evaluate((node) => node.click()), // click via DOM (imgs pueden estar bloqueadas)
-  ]);
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout: T.download }),
+        el.evaluate((node) => node.click()),
+      ]);
 
-  const stream = await download.createReadStream();
-  const chunks = [];
-  for await (const c of stream) chunks.push(c);
-  const buffer = Buffer.concat(chunks);
+      const stream = await download.createReadStream();
+      const chunks = [];
+      for await (const c of stream) chunks.push(c);
+      const buffer = Buffer.concat(chunks);
 
-  // limpiar temp de Playwright — evita saturar %TEMP% en runs largos
-  await download.delete().catch(() => {});
+      await download.delete().catch(() => {});
 
-  return {
-    filename: download.suggestedFilename() || filename,
-    buffer,
-    size: buffer.length,
-  };
+      return {
+        filename: download.suggestedFilename() || filename,
+        buffer,
+        size: buffer.length,
+      };
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) {
+        console.warn(`[descarga retry ${attempt}/${retries}] ${filename}: ${e.message.slice(0, 80)}`);
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -262,6 +273,7 @@ export async function scrapeDetalleConDescarga({
   nidConvocatoria,
   filters,
   downloadBases = false,
+  seenDocs = null, // Map<key, descarga> para dedup runtime
 }) {
   return withPage(async (page) => {
     const t0 = Date.now();
@@ -281,6 +293,17 @@ export async function scrapeDetalleConDescarga({
       if (docSelected.doc && docSelected.doc.descargas.length) {
         const targetFilename = docSelected.doc.descargas[0].filename;
 
+        // DEDUP RUNTIME: si ya descargamos un filename+size igual en este run, reusa
+        const dedupKey = `${targetFilename}|${docSelected.doc.sizeText || ""}`;
+        if (seenDocs && seenDocs.has(dedupKey)) {
+          const reusada = seenDocs.get(dedupKey);
+          console.log(
+            `[dedup HIT] ${nomenclatura}: ${targetFilename} ya descargado en este run, reuso buffer`
+          );
+          descarga = { ...reusada, _deduped: true };
+          return { detalle, descarga, docSelected };
+        }
+
         // skip por tamaño si excede maxDocMB (lee de meta sizeText "(N KB)")
         const maxDocMB = filters?.maxDocMB ?? 50;
         const sizeMB = parseSizeMB(docSelected.doc.sizeText);
@@ -299,6 +322,8 @@ export async function scrapeDetalleConDescarga({
             console.log(
               `[descarga] ${nomenclatura}: ${descarga.filename} ${Math.round(descarga.size / 1024)}KB en ${Date.now() - tDl}ms`
             );
+            // memoizar para dedup en este run
+            if (seenDocs) seenDocs.set(dedupKey, descarga);
           } catch (e) {
             console.warn(`[descarga FAIL] ${nomenclatura}: ${e.message}`);
           }

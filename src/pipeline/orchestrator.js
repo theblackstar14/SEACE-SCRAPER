@@ -16,6 +16,7 @@ import {
   extractRequisitosWithGeminiPdf,
   extractRequisitosWithGeminiText,
 } from "../analyzer/llmExtractor.js";
+import { hashBuffer, getByHash, setByHash, stats as hashCacheStats } from "../analyzer/hashCache.js";
 
 /**
  * Elige provider óptimo según el caso:
@@ -419,6 +420,9 @@ export async function runObraPipeline({
   });
 
   // 5. DETALLE COMPLETO + DESCARGA — solo de los que pasaron filtros
+  // Dedup runtime: filename+size visto antes en este run = reusa buffer
+  const seenDocs = new Map(); // key=filename+size, val={buffer, filename, tipo, size}
+
   const detallados = await Promise.all(
     conTiempo.map((c, idx) =>
       lim(async () => {
@@ -436,6 +440,8 @@ export async function runObraPipeline({
               maxDocMB,
             },
             downloadBases: !skipPdf,
+            // pasa seenDocs para dedup
+            seenDocs,
           });
           return { listado: p, detalle, descarga, docSelected, error: null };
         } catch (e) {
@@ -492,6 +498,38 @@ export async function runObraPipeline({
       size: descarga.size,
       confianza: docSelected.confianza,
     };
+
+    // CACHE POR HASH: si ya analizamos este buffer exacto antes, reusar
+    const docHash = hashBuffer(descarga.buffer);
+    analisis.docHash = docHash;
+    const cached = await getByHash(docHash);
+    if (cached) {
+      console.log(`[cache HIT] ${p.nomenclatura} hash ${docHash.slice(0, 12)}... — reusa análisis previo`);
+      analisis.cacheHit = true;
+      analisis.requisitos = cached.requisitos;
+      analisis.calidadTexto = cached.calidadTexto;
+      analisis.zipContents = cached.zipContents || null;
+      // re-evaluar contra empresa (puede haber cambiado entre runs)
+      if (cached.requisitos?.experienciaMonto) {
+        analisis.evaluacion = evaluarProceso(
+          {
+            experienciaMonto: cached.requisitos.experienciaMonto,
+            tiposObraSimilar: (cached.requisitos.tipoObra || "").split("|").filter(Boolean),
+            antiguedadMaxAnios: cached.requisitos.antiguedadMaxAnios,
+          },
+          empresa,
+          { consorcioRatio: 0.5 }
+        );
+        analisis.evaluacion.razones.unshift(`📦 Cache hit (hash ${docHash.slice(0, 8)})`);
+      } else {
+        analisis.evaluacion = cached.evaluacion || {
+          resultado: "indeterminado",
+          razones: [`📦 Cache hit: ${cached.calidadTexto?.razonCalidad || "sin requisitos extraíbles"}`],
+        };
+      }
+      enriquecidos.push({ listado: p, detalle, analisis });
+      continue;
+    }
 
     try {
       const doc = await extractTextFromDoc(descarga);
@@ -774,8 +812,25 @@ export async function runObraPipeline({
       };
     }
 
+    // guardar en cache hash si tuvimos análisis (cualquiera, incluso indeterminado)
+    if (analisis.docHash && !analisis.cacheHit && (analisis.requisitos || analisis.calidadTexto)) {
+      await setByHash(analisis.docHash, {
+        requisitos: analisis.requisitos,
+        calidadTexto: analisis.calidadTexto,
+        zipContents: analisis.zipContents,
+        evaluacion: analisis.evaluacion,
+      }, {
+        filename: analisis.documentoUsado?.filename,
+        size: analisis.documentoUsado?.size,
+      }).catch(() => {});
+    }
+
     enriquecidos.push({ listado: p, detalle, analisis });
   }
+
+  // log stats cache
+  const cstats = await hashCacheStats();
+  emit("cache_stats", { msg: `cache: ${cstats.entries} entries, ${cstats.totalHits} hits, ${cstats.sizeKB}KB` });
 
   // 7. BUILD OUTPUT con score y sort
   const procesos = enriquecidos
@@ -819,6 +874,9 @@ export async function runObraPipeline({
     })
     .sort((a, b) => (b.score || 0) - (a.score || 0)); // mejor primero
 
+  const cacheHitsRun = enriquecidos.filter((e) => e.analisis.cacheHit).length;
+  const dedupHitsRun = activos.filter((d) => d.descarga?._deduped).length;
+
   const resumen = {
     totalListados: listado.length,
     limit,
@@ -835,6 +893,9 @@ export async function runObraPipeline({
     templates: procesos.filter((p) => p.calidadTexto?.template).length,
     llmUsed: procesos.filter((p) => p.llmUsed).length,
     llmEnabled: useLlm,
+    cacheHashHits: cacheHitsRun,
+    dedupRuntimeHits: dedupHitsRun,
+    cacheStats: cstats,
     parametros: { minDias, maxMontoRatio, maxPubDias, maxDocMB },
     duracionMs: Date.now() - runStart,
   };

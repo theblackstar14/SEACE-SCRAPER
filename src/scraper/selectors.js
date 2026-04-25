@@ -43,7 +43,7 @@ export const T = {
   selector: 60_000,
   results: 25_000,
   ficha: 20_000,
-  download: 30_000,
+  download: 60_000,
 };
 
 // valores válidos del dropdown "Objeto de Contratación"

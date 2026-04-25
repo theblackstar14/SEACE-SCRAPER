@@ -162,6 +162,12 @@ async function main() {
       const breakdown = Object.entries(byProvider).map(([k, v]) => `${k}:${v}`).join(", ");
       console.log(`   ✨ LLM:              ${payload.resumen.llmUsed} procesos${breakdown ? ` (${breakdown})` : ""}`);
     }
+    if (payload.resumen.cacheHashHits) {
+      console.log(`   📦 Cache hash hits:  ${payload.resumen.cacheHashHits} (ahorró LLM calls)`);
+    }
+    if (payload.resumen.dedupRuntimeHits) {
+      console.log(`   ♻️  Dedup runtime:    ${payload.resumen.dedupRuntimeHits} (reuso descarga)`);
+    }
     console.log(`   Duración:           ${(payload.resumen.duracionMs / 1000).toFixed(1)}s`);
 
     // Top 5 procesos por score
