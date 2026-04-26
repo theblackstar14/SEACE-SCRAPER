@@ -1,28 +1,39 @@
 import { withPage } from "../browserPool.js";
-import { parseTable } from "./parser.js";
-import { config } from "../config/config.js";
+import { openBuscador, collectAllPages, getPaginatorInfo, OBJETO } from "./common.js";
 
-export async function scrapeSeace({ limit = 10 } = {}) {
+/**
+ * Scrape SEACE con filtros.
+ *
+ * @param {object} opts
+ *   - limit: max filas a retornar (default: 50)
+ *   - objetoContratacion: "Bien"|"Servicio"|"Consultoría"|"Obra"
+ *   - fechaDesde: Date | "DD/MM/YYYY"
+ *   - fechaHasta: Date | "DD/MM/YYYY"
+ *   - allPages: bool (default false) — si true ignora limit y trae todas
+ *   - maxPages: cota de páginas a visitar (default 50)
+ */
+export async function scrapeSeace(opts = {}) {
+  const { limit = 50, allPages = false, maxPages = 50, ...filters } = opts;
   return withPage(async (page) => {
-    await page.goto(config.baseUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForSelector("a[href='#tbBuscador\\:tab1']", { timeout: 60000 });
-    await page.click("a[href='#tbBuscador\\:tab1']");
-    await page.waitForTimeout(1500);
-    await page.click("#tbBuscador\\:idFormBuscarProceso\\:btnBuscarSelToken");
-    await page.waitForTimeout(4000);
+    const t0 = Date.now();
+    await openBuscador(page, filters);
 
-    await page.waitForFunction(() => {
-      const rs = document.querySelectorAll(
-        "#tbBuscador\\:idFormBuscarProceso\\:dtProcesos tbody tr"
-      );
-      return rs.length > 0 && rs[0].innerText.trim().length > 10;
-    }, { timeout: 15000 });
+    const info = await getPaginatorInfo(page);
+    if (info) {
+      console.log(`[scrapeSeace] paginator: ${info.total} totales, ${info.pages} páginas`);
+    }
 
-    const html = await page.$eval(
-      "#tbBuscador\\:idFormBuscarProceso\\:pnlGrdResultadosProcesos",
-      (el) => el.innerHTML
+    const rows = await collectAllPages(page, {
+      maxRows: allPages ? Infinity : limit,
+      maxPages,
+    });
+
+    console.log(
+      `[scrapeSeace] ${rows.length} filas obtenidas en ${Date.now() - t0}ms` +
+        (filters.objetoContratacion ? ` (filtro: ${filters.objetoContratacion})` : "")
     );
-
-    return parseTable(html).slice(0, limit);
+    return rows;
   });
 }
+
+export { OBJETO };

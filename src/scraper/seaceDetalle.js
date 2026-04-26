@@ -1,130 +1,358 @@
 import { withPage } from "../browserPool.js";
-import { config } from "../config/config.js";
+import { navigateToFicha } from "./common.js";
+import { T } from "./selectors.js";
+import { extractCronograma, findFechaPresentacion } from "./cronograma.js";
+import { extractDocumentos, selectBasesIntegradas } from "./documentos.js";
+import { parseMonto } from "./parser.js";
 import * as cheerio from "cheerio";
 
 const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-const normKey = (s) => norm(s).toLowerCase();
+const normKey = (s) =>
+  norm(s)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // sin acentos
+    .replace(/[^\w ]/g, "") // quitar `:`, `/`, etc.
+    .trim();
 
-function fieldByLabel($, label) {
-  const target = normKey(label);
+/**
+ * Busca la celda <td> siguiente a una celda cuyo texto matches label (con/sin acentos).
+ * Prueba varias variantes.
+ */
+function fieldByLabels($, labels) {
+  const targets = labels.map(normKey);
   let val = "";
   $("td").each((_, el) => {
-    if (normKey($(el).text()) === target) {
+    const k = normKey($(el).text());
+    if (targets.includes(k)) {
       val = norm($(el).next().text());
-      return false;
+      if (val) return false; // break
     }
   });
   return val;
 }
 
-function parseDataTable($, idSuffix, headers) {
-  const tbody = $(`tbody[id$='${idSuffix}_data']`).first();
-  if (!tbody.length) return [];
-  const result = [];
-  tbody.find("tr[data-ri]").each((_, tr) => {
-    const tds = $(tr).find("> td");
-    if (!tds.length) return;
-    const row = {};
-    headers.forEach((h, i) => {
-      row[h] = norm($(tds[i]).text());
-    });
-    const dlLinks = [];
-    $(tr).find("a[onclick*='descargaDocGeneral']").each((_, a) => {
-      const oc = $(a).attr("onclick") || "";
-      const m = oc.match(/descargaDocGeneral\('([^']+)','([^']+)','([^']+)'/);
-      if (m) dlLinks.push({ hash: m[1], sistema: m[2], filename: m[3] });
-    });
-    if (dlLinks.length) row.descargas = dlLinks;
-    result.push(row);
-  });
-  return result;
-}
-
-async function findRowAndClick(page, { nomenclatura, nidProceso }) {
-  await page.goto(config.baseUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForSelector("a[href='#tbBuscador\\:tab1']", { timeout: 60000 });
-  await page.click("a[href='#tbBuscador\\:tab1']");
-  await page.waitForTimeout(1500);
-  await page.click("#tbBuscador\\:idFormBuscarProceso\\:btnBuscarSelToken");
-  await page.waitForTimeout(4000);
-  await page.waitForFunction(() => {
-    const rs = document.querySelectorAll(
-      "#tbBuscador\\:idFormBuscarProceso\\:dtProcesos tbody tr"
-    );
-    return rs.length > 0 && rs[0].innerText.trim().length > 10;
-  }, { timeout: 15000 });
-
-  let row = null;
-  let intento = 0;
-  while (!row && intento < 10) {
-    row = await page.evaluateHandle(({ nom, nid }) => {
-      const rows = document.querySelectorAll(
-        "#tbBuscador\\:idFormBuscarProceso\\:dtProcesos tbody tr"
-      );
-      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-      for (const r of rows) {
-        const cells = r.querySelectorAll("td");
-        const nomCell = cells[3] ? norm(cells[3].innerText) : "";
-        if (nom && nomCell === norm(nom)) return r;
-        if (nid) {
-          const a = r.querySelector("a.ui-commandlink");
-          if (a?.getAttribute("onclick")?.includes(`'nidProceso':'${nid}'`)) return r;
-        }
-      }
-      return null;
-    }, { nom: nomenclatura, nid: nidProceso });
-
-    if (!row.asElement()) {
-      row = null;
-      const next = await page.$(".ui-paginator-next:not(.ui-state-disabled)");
-      if (!next) break;
-      await next.click();
-      await page.waitForTimeout(2500);
-      intento++;
-    }
-  }
-
-  if (!row) throw new Error("Proceso no encontrado");
-
-  const btn = await row.asElement().$("a:has(img[src*='fichaSeleccion'])");
-  if (!btn) throw new Error("Botón ficha no encontrado");
-  await btn.click();
-  await page.waitForSelector("td:has-text('Entidad Convocante')", { timeout: 20000 });
-  await page.waitForTimeout(2000);
-}
-
-export async function scrapeDetalle({ nomenclatura, nidProceso }) {
+export async function scrapeDetalle({ nomenclatura, nidProceso, nidConvocatoria, filters }) {
   return withPage(async (page) => {
-    await findRowAndClick(page, { nomenclatura, nidProceso });
+    const t0 = Date.now();
+    await navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters });
     const html = await page.content();
     const $ = cheerio.load(html);
 
-    return {
-      nomenclatura: fieldByLabel($, "Nomenclatura"),
-      nConvocatoria: fieldByLabel($, "N° Convocatoria"),
-      tipoCompra: fieldByLabel($, "Tipo Compra o Selección"),
-      normativa: fieldByLabel($, "Normativa Aplicable"),
-      versionSeace: fieldByLabel($, "Versión SEACE"),
-      entidad: fieldByLabel($, "Entidad Convocante"),
-      direccion: fieldByLabel($, "Direccion Legal") || fieldByLabel($, "Dirección Legal"),
-      web: fieldByLabel($, "Pagina Web") || fieldByLabel($, "Página Web"),
-      telefono: fieldByLabel($, "Télefono de la Entidad") || fieldByLabel($, "Teléfono de la Entidad"),
-      objeto: fieldByLabel($, "Objeto de Contratación"),
-      descripcion: fieldByLabel($, "Descripción del Objeto") || fieldByLabel($, "Descripción del objeto"),
-      vrCuantia: fieldByLabel($, "VR / VE / Cuantía de la contratación"),
-      montoDerecho: fieldByLabel($, "Monto del Derecho de Participacion") || fieldByLabel($, "Monto del Derecho de Participación"),
-      montoBases: fieldByLabel($, "Monto del costo de Reproducción de las Bases"),
-      fechaPublicacion: fieldByLabel($, "Fecha y hora de Publicación del reinicio"),
-      reiniciadoDesde: fieldByLabel($, "Reiniciado Desde"),
-      cronograma: parseDataTable($, ":dtCronograma", ["etapa", "inicio", "fin"]),
-      documentos: parseDataTable($, ":dtDocumentos", ["nro", "etapa", "documento", "archivo", "fecha"]),
+    // labels reales confirmados SEACE 2026-04 (incluye typos/variantes)
+    const cronograma = extractCronograma($);
+    const fechaPresentacion = findFechaPresentacion(cronograma);
+    const documentos = extractDocumentos($);
+
+    const data = {
+      nomenclatura: fieldByLabels($, ["Nomenclatura"]),
+      nConvocatoria: fieldByLabels($, ["N° Convocatoria", "Nº Convocatoria", "N Convocatoria"]),
+      tipoCompra: fieldByLabels($, ["Tipo Compra o Selección", "Tipo Compra o Seleccion"]),
+      normativa: fieldByLabels($, ["Normativa Aplicable"]),
+      versionSeace: fieldByLabels($, ["Versión SEACE", "Version SEACE"]),
+
+      entidad: fieldByLabels($, ["Entidad Convocante"]),
+      direccion: fieldByLabels($, ["Direccion Legal", "Dirección Legal"]),
+      web: fieldByLabels($, ["Pagina Web", "Página Web"]),
+      telefono: fieldByLabels($, [
+        "Télefono de la Entidad",
+        "Teléfono de la Entidad",
+        "Telefono de la Entidad",
+      ]),
+
+      objeto: fieldByLabels($, ["Objeto de Contratación", "Objeto de Contratacion"]),
+      descripcion: fieldByLabels($, [
+        "Descripción del Objeto",
+        "Descripcion del Objeto",
+        "Descripción del objeto",
+      ]),
+      vrCuantia: fieldByLabels($, [
+        "VR / VE / Cuantía de la contratación",
+        "VR / VE / Cuantia de la contratacion",
+      ]),
+      vrCuantiaMonto: parseMonto(
+        (fieldByLabels($, [
+          "VR / VE / Cuantía de la contratación",
+          "VR / VE / Cuantia de la contratacion",
+        ]) || "").replace(/\s*Soles\s*$/i, "")
+      ),
+      montoDerecho: fieldByLabels($, [
+        "Monto del Derecho de Participacion",
+        "Monto del Derecho de Participación",
+      ]),
+      montoBases: fieldByLabels($, [
+        "Monto del costo de Reproducción de las Bases",
+        "Monto del costo de Reproduccion de las Bases",
+      ]),
+      fechaPublicacion: fieldByLabels($, [
+        "Fecha y Hora Publicación",
+        "Fecha y Hora Publicacion",
+        "Fecha y hora de Publicación del reinicio",
+      ]),
+      reiniciadoDesde: fieldByLabels($, ["Reiniciado Desde"]),
+
+      // Entidad Contratante (panel derecho inferior)
+      entidadContratanteRuc: fieldByLabels($, ["N° Ruc", "N Ruc"]),
+      entidadContratanteNombre: fieldByLabels($, ["Entidad Contratante"]),
+
+      // estructurados
+      cronograma,
+      fechaPresentacion, // { inicio, fin, inicioISO, finISO, estado: 'activo'|'vencido'|'pendiente' }
+      documentos,
+
+      // flags derivados rápidos
+      _fichaTimestamp: new Date().toISOString(),
     };
+
+    console.log(
+      `[scrapeDetalle] ${nomenclatura || nidProceso} en ${Date.now() - t0}ms — ` +
+        `presentación: ${fechaPresentacion?.estado || "?"} (${fechaPresentacion?.fin || "s/f"})`
+    );
+    return data;
   });
 }
 
-export async function descargarDoc({ nomenclatura, nidProceso, filename }) {
+/**
+ * VERSIÓN LIGERA: solo lee cronograma + fechaPresentacion. NO parsea labels,
+ * NO descarga, NO extrae documentos. Para pre-filtrado rápido.
+ *
+ * Tiempo típico: ~30s (la mayoría es openBuscador navigation, irreducible
+ * sin HTTP directo).
+ *
+ * Útil para: descartar procesos vencidos o sin tiempo de postular ANTES
+ * de gastar bandwidth/LLM en su análisis completo.
+ */
+export async function scrapeCronogramaOnly({ nomenclatura, nidProceso, nidConvocatoria, filters }) {
   return withPage(async (page) => {
-    await findRowAndClick(page, { nomenclatura, nidProceso });
+    const t0 = Date.now();
+    await navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters });
+    const html = await page.content();
+    const $ = cheerio.load(html);
+    const cronograma = extractCronograma($);
+    const fechaPresentacion = findFechaPresentacion(cronograma);
+    console.log(
+      `[cronograma] ${nomenclatura || nidProceso} en ${Date.now() - t0}ms — ` +
+        `presentación: ${fechaPresentacion?.estado || "?"} (${fechaPresentacion?.fin || "s/f"})`
+    );
+    return { cronograma, fechaPresentacion };
+  });
+}
+
+/**
+ * Parsea el HTML de una ficha ya abierta en `page` y retorna data estructurada.
+ * Extraído de scrapeDetalle para reuso.
+ */
+async function parseFichaFromPage(page, { nomenclatura, nidProceso } = {}) {
+  const html = await page.content();
+  const $ = cheerio.load(html);
+
+  const cronograma = extractCronograma($);
+  const fechaPresentacion = findFechaPresentacion(cronograma);
+  const documentos = extractDocumentos($);
+
+  return {
+    nomenclatura: fieldByLabels($, ["Nomenclatura"]) || nomenclatura,
+    nConvocatoria: fieldByLabels($, ["N° Convocatoria", "Nº Convocatoria", "N Convocatoria"]),
+    tipoCompra: fieldByLabels($, ["Tipo Compra o Selección", "Tipo Compra o Seleccion"]),
+    normativa: fieldByLabels($, ["Normativa Aplicable"]),
+    versionSeace: fieldByLabels($, ["Versión SEACE", "Version SEACE"]),
+
+    entidad: fieldByLabels($, ["Entidad Convocante"]),
+    direccion: fieldByLabels($, ["Direccion Legal", "Dirección Legal"]),
+    web: fieldByLabels($, ["Pagina Web", "Página Web"]),
+    telefono: fieldByLabels($, [
+      "Télefono de la Entidad",
+      "Teléfono de la Entidad",
+      "Telefono de la Entidad",
+    ]),
+
+    objeto: fieldByLabels($, ["Objeto de Contratación", "Objeto de Contratacion"]),
+    descripcion: fieldByLabels($, [
+      "Descripción del Objeto",
+      "Descripcion del Objeto",
+      "Descripción del objeto",
+    ]),
+    vrCuantia: fieldByLabels($, [
+      "VR / VE / Cuantía de la contratación",
+      "VR / VE / Cuantia de la contratacion",
+    ]),
+    vrCuantiaMonto: parseMonto(
+      (fieldByLabels($, [
+        "VR / VE / Cuantía de la contratación",
+        "VR / VE / Cuantia de la contratacion",
+      ]) || "").replace(/\s*Soles\s*$/i, "")
+    ),
+    montoDerecho: fieldByLabels($, [
+      "Monto del Derecho de Participacion",
+      "Monto del Derecho de Participación",
+    ]),
+    montoBases: fieldByLabels($, [
+      "Monto del costo de Reproducción de las Bases",
+      "Monto del costo de Reproduccion de las Bases",
+    ]),
+    fechaPublicacion: fieldByLabels($, [
+      "Fecha y Hora Publicación",
+      "Fecha y Hora Publicacion",
+      "Fecha y hora de Publicación del reinicio",
+    ]),
+    reiniciadoDesde: fieldByLabels($, ["Reiniciado Desde"]),
+    entidadContratanteRuc: fieldByLabels($, ["N° Ruc", "N Ruc"]),
+    entidadContratanteNombre: fieldByLabels($, ["Entidad Contratante"]),
+
+    cronograma,
+    fechaPresentacion,
+    documentos,
+    _fichaTimestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * Descarga un documento específico de la ficha ya abierta (sin re-navegar).
+ * Retry x3 con timeout 60s. Limpia temp post-lectura.
+ */
+async function downloadFromPage(page, filename, { retries = 3 } = {}) {
+  const dlAnchor = await page.evaluateHandle((fname) => {
+    const anchors = document.querySelectorAll("a[onclick*='descargaDocGeneral']");
+    for (const a of anchors) {
+      if ((a.getAttribute("onclick") || "").includes(fname)) return a;
+    }
+    return null;
+  }, filename);
+
+  const el = dlAnchor.asElement();
+  if (!el) throw new Error(`Archivo no encontrado en ficha: ${filename}`);
+
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout: T.download }),
+        el.evaluate((node) => node.click()),
+      ]);
+
+      const stream = await download.createReadStream();
+      const chunks = [];
+      for await (const c of stream) chunks.push(c);
+      const buffer = Buffer.concat(chunks);
+
+      await download.delete().catch(() => {});
+
+      return {
+        filename: download.suggestedFilename() || filename,
+        buffer,
+        size: buffer.length,
+      };
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) {
+        console.warn(`[descarga retry ${attempt}/${retries}] ${filename}: ${e.message.slice(0, 80)}`);
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * OPTIMIZACIÓN PRINCIPAL: Scrapea detalle Y descarga el doc best-match en UNA
+ * sola navegación. Antes usábamos 2 openBuscador separados = ~60s wasted por
+ * proceso. Ahora ~30s total.
+ *
+ * @param {object} opts
+ *  - nomenclatura, nidProceso, nidConvocatoria, filters (igual que scrapeDetalle)
+ *  - downloadBases: bool — si true, descarga Bases Integradas/Administrativas
+ *
+ * @returns { detalle, descarga, docSelected }
+ *   - detalle: igual que scrapeDetalle
+ *   - descarga: { filename, buffer, size, tipo } | null
+ *   - docSelected: output de selectBasesIntegradas (para logs)
+ */
+export async function scrapeDetalleConDescarga({
+  nomenclatura,
+  nidProceso,
+  nidConvocatoria,
+  filters,
+  downloadBases = false,
+  seenDocs = null, // Map<key, descarga> para dedup runtime
+}) {
+  return withPage(async (page) => {
+    const t0 = Date.now();
+    await navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters });
+
+    const detalle = await parseFichaFromPage(page, { nomenclatura, nidProceso });
+    console.log(
+      `[scrapeDetalle] ${nomenclatura || nidProceso} en ${Date.now() - t0}ms — ` +
+        `presentación: ${detalle.fechaPresentacion?.estado || "?"} (${detalle.fechaPresentacion?.fin || "s/f"})`
+    );
+
+    let descarga = null;
+    let docSelected = null;
+
+    if (downloadBases) {
+      docSelected = selectBasesIntegradas(detalle.documentos);
+      if (docSelected.doc && docSelected.doc.descargas.length) {
+        const targetFilename = docSelected.doc.descargas[0].filename;
+
+        // DEDUP RUNTIME: si ya descargamos un filename+size igual en este run, reusa
+        const dedupKey = `${targetFilename}|${docSelected.doc.sizeText || ""}`;
+        if (seenDocs && seenDocs.has(dedupKey)) {
+          const reusada = seenDocs.get(dedupKey);
+          console.log(
+            `[dedup HIT] ${nomenclatura}: ${targetFilename} ya descargado en este run, reuso buffer`
+          );
+          descarga = { ...reusada, _deduped: true };
+          return { detalle, descarga, docSelected };
+        }
+
+        // skip por tamaño si excede maxDocMB (lee de meta sizeText "(N KB)")
+        const maxDocMB = filters?.maxDocMB ?? 50;
+        const sizeMB = parseSizeMB(docSelected.doc.sizeText);
+        if (sizeMB && sizeMB > maxDocMB) {
+          console.warn(
+            `[descarga SKIP] ${nomenclatura}: ${targetFilename} ${sizeMB}MB > limit ${maxDocMB}MB`
+          );
+          docSelected.skipped = true;
+          docSelected.skipReason = `archivo ${sizeMB}MB > ${maxDocMB}MB`;
+        } else {
+          try {
+            const tDl = Date.now();
+            descarga = await downloadFromPage(page, targetFilename);
+            const tipo = (descarga.filename.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+            descarga.tipo = tipo;
+            console.log(
+              `[descarga] ${nomenclatura}: ${descarga.filename} ${Math.round(descarga.size / 1024)}KB en ${Date.now() - tDl}ms`
+            );
+            // memoizar para dedup en este run
+            if (seenDocs) seenDocs.set(dedupKey, descarga);
+          } catch (e) {
+            console.warn(`[descarga FAIL] ${nomenclatura}: ${e.message}`);
+          }
+        }
+      }
+    }
+
+    return { detalle, descarga, docSelected };
+  });
+}
+
+/**
+ * Parsea sizeText tipo "(5884 KB)" → MB number, o null si no parsea.
+ */
+function parseSizeMB(sizeText) {
+  if (!sizeText) return null;
+  const m = String(sizeText).match(/\(([\d.,]+)\s*([KMG]?B)\)/i);
+  if (!m) return null;
+  const num = parseFloat(m[1].replace(",", "."));
+  const unit = m[2].toUpperCase();
+  if (unit === "KB") return num / 1024;
+  if (unit === "MB") return num;
+  if (unit === "GB") return num * 1024;
+  return num / 1024 / 1024; // bytes
+}
+
+export async function descargarDoc({ nomenclatura, nidProceso, nidConvocatoria, filename, filters }) {
+  return withPage(async (page) => {
+    await navigateToFicha(page, { nomenclatura, nidProceso, nidConvocatoria, filters });
 
     const dlAnchor = await page.evaluateHandle((fname) => {
       const anchors = document.querySelectorAll("a[onclick*='descargaDocGeneral']");
@@ -135,19 +363,21 @@ export async function descargarDoc({ nomenclatura, nidProceso, filename }) {
     }, filename);
 
     const el = dlAnchor.asElement();
-    if (!el) throw new Error("Archivo no encontrado en ficha");
+    if (!el) throw new Error(`Archivo no encontrado en ficha: ${filename}`);
 
     const [download] = await Promise.all([
-      page.waitForEvent("download", { timeout: 30000 }),
+      page.waitForEvent("download", { timeout: T.download }),
       el.click(),
     ]);
 
     const stream = await download.createReadStream();
     const chunks = [];
     for await (const c of stream) chunks.push(c);
+    const buffer = Buffer.concat(chunks);
     return {
       filename: download.suggestedFilename() || filename,
-      buffer: Buffer.concat(chunks),
+      buffer,
+      size: buffer.length,
     };
   });
 }

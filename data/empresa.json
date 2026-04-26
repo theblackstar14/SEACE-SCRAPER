@@ -1,0 +1,84 @@
+{
+  "razonSocial": "CONSTRUCTORA DEMO S.A.C.",
+  "ruc": "20512345678",
+  "capacidadContratacionCAPECO": 15000000,
+  "especialidades": [
+    "edificacion",
+    "saneamiento",
+    "muros"
+  ],
+  "experiencia": [
+    {
+      "obra": "Construcción Colegio Inicial 101 - San Juan de Lurigancho",
+      "entidad": "Municipalidad de San Juan de Lurigancho",
+      "monto": 3200000,
+      "tipo": "educativa",
+      "anio": 2023
+    },
+    {
+      "obra": "Ampliación red agua potable sector Comas",
+      "entidad": "SEDAPAL",
+      "monto": 4500000,
+      "tipo": "saneamiento",
+      "anio": 2024
+    },
+    {
+      "obra": "Muro de contención km 12 Av. Los Incas",
+      "entidad": "Municipalidad de Ate",
+      "monto": 1800000,
+      "tipo": "muros",
+      "anio": 2022
+    },
+    {
+      "obra": "Edificación administrativa 3 pisos - Chorrillos",
+      "entidad": "Municipalidad Distrital de Chorrillos",
+      "monto": 2800000,
+      "tipo": "edificacion",
+      "anio": 2024
+    }
+  ],
+  "personal": [
+    {
+      "nombres": "Ing. Juan Pérez",
+      "profesion": "Ingeniero Civil",
+      "expMeses": 120,
+      "especialidad": "residente",
+      "dni": "40000001"
+    },
+    {
+      "nombres": "Ing. María García",
+      "profesion": "Ingeniero Civil",
+      "expMeses": 96,
+      "especialidad": "estructuras",
+      "dni": "40000002"
+    },
+    {
+      "nombres": "Ing. Carlos López",
+      "profesion": "Ingeniero Civil",
+      "expMeses": 72,
+      "especialidad": "suelos",
+      "dni": "40000003"
+    },
+    {
+      "nombres": "Ing. Rosa Vega",
+      "profesion": "Ingeniero Sanitario",
+      "expMeses": 84,
+      "especialidad": "saneamiento",
+      "dni": "40000004"
+    },
+    {
+      "nombres": "Ing. Pedro Quispe",
+      "profesion": "Ingeniero Eléctrico",
+      "expMeses": 60,
+      "especialidad": "electricas",
+      "dni": "40000005"
+    },
+    {
+      "nombres": "Ing. Lucia Torres",
+      "profesion": "Arquitecto",
+      "expMeses": 108,
+      "especialidad": "arquitectura",
+      "dni": "40000006"
+    }
+  ]
+}
