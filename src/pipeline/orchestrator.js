@@ -17,6 +17,7 @@ import {
   extractRequisitosWithGeminiText,
 } from "../analyzer/llmExtractor.js";
 import { hashBuffer, getByHash, setByHash, stats as hashCacheStats } from "../analyzer/hashCache.js";
+import { parseUbicacionMixed } from "../scraper/ubigeoParser.js";
 
 /**
  * Elige provider óptimo según el caso:
@@ -273,7 +274,10 @@ function mapLlmToRequisitos(llm, { fuente = "claude" } = {}) {
       fragmento: c,
     })),
     tipoObra: (llm.tiposObraSimilar || []).join("|"),
+    tiposObraSimilar: llm.tiposObraSimilar || [],
     antiguedadMaxAnios: llm.antiguedadMaxAnios,
+    plantel: llm.plantel || [],
+    lugarEjecucion: llm.lugarEjecucion || null,
     requiereLlm: false, // ya lo usamos
     sospecha: null,
     paginas: llm.meta?.pagesAnalyzed || null,
@@ -526,6 +530,7 @@ export async function runObraPipeline({
             experienciaMonto: cached.requisitos.experienciaMonto,
             tiposObraSimilar: (cached.requisitos.tipoObra || "").split("|").filter(Boolean),
             antiguedadMaxAnios: cached.requisitos.antiguedadMaxAnios,
+            plantel: cached.requisitos.plantel || [],
           },
           empresa,
           { consorcioRatio: 0.5 }
@@ -603,7 +608,12 @@ export async function runObraPipeline({
             };
           } else {
             analisis.evaluacion = evaluarProceso(
-              { experienciaMonto: llm.experienciaMonto, tiposObraSimilar: llm.tiposObraSimilar, antiguedadMaxAnios: llm.antiguedadMaxAnios },
+              {
+                experienciaMonto: llm.experienciaMonto,
+                tiposObraSimilar: llm.tiposObraSimilar,
+                antiguedadMaxAnios: llm.antiguedadMaxAnios,
+                plantel: llm.plantel,
+              },
               empresa,
               { consorcioRatio: 0.5 }
             );
@@ -746,6 +756,7 @@ export async function runObraPipeline({
                   experienciaMonto: llm.experienciaMonto,
                   tiposObraSimilar: llm.tiposObraSimilar,
                   antiguedadMaxAnios: llm.antiguedadMaxAnios,
+                  plantel: llm.plantel,
                 },
                 empresa,
                 { consorcioRatio: 0.5 }
@@ -847,10 +858,13 @@ export async function runObraPipeline({
     .map(({ listado: p, detalle, analisis }) => {
       const descripcionFull = detalle.descripcion || p.descripcion || "";
       const descripcionCorta = descripcionFull.slice(0, 120);
+      const entidadFinal = detalle.entidad || p.entidad;
+      const lugarEjecucion = analisis.requisitos?.lugarEjecucion || null;
+      const ubicacion = parseUbicacionMixed(entidadFinal, lugarEjecucion);
       const proceso = {
         // identificación principal (orden visible)
         nomenclatura: p.nomenclatura,
-        entidad: detalle.entidad || p.entidad,
+        entidad: entidadFinal,
         descripcionCorta,
         descripcion: descripcionFull,
         // IDs internos
@@ -859,6 +873,11 @@ export async function runObraPipeline({
         objeto: detalle.objeto || p.objetoContratacion,
         valorReferencial: detalle.vrCuantiaMonto ?? p.vrCuantia ?? null,
         moneda: p.moneda || "PEN",
+        // ubicación
+        region: ubicacion.region,
+        provincia: ubicacion.provincia,
+        distrito: ubicacion.distrito,
+        lugarEjecucion,
         fechaPublicacion: detalle.fechaPublicacion || p.fechaPublicacion,
         fechaPropuesta: detalle.fechaPresentacion?.finIso || detalle.fechaPresentacion?.fin || null,
         diasRestantes: detalle.fechaPresentacion?.diasRestantes ?? null,
@@ -877,10 +896,12 @@ export async function runObraPipeline({
               requiereRevisionManual: analisis.requisitos.requiereLlm,
             }
           : null,
+        plantel: analisis.requisitos?.plantel || [],
         evaluacion: {
           resultado: analisis.evaluacion?.resultado || "indeterminado",
           razones: analisis.evaluacion?.razones || [],
           sugerenciaConsorcio: analisis.evaluacion?.sugerenciaConsorcio || null,
+          plantel: analisis.evaluacion?.plantel || null,
         },
         warnings: analisis.warnings,
       };

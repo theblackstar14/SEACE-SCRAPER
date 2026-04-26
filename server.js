@@ -253,18 +253,56 @@ app.get("/api/v2/procesos", async (req, res) => {
   if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
   try {
     const sb = createSupabaseStore();
-    const { resultado, estado, minScore, minDias, orderBy, direction, limit, offset } = req.query;
+    const {
+      resultado, estado, minScore, minDias,
+      minMonto, maxMonto,
+      region, provincia, distrito,
+      cumplePlantel, search,
+      orderBy, direction, limit, offset,
+    } = req.query;
     const result = await sb.queryProcesos({
       resultado,
       estado,
       minScore: minScore ? Number(minScore) : undefined,
       minDias: minDias ? Number(minDias) : undefined,
+      minMonto: minMonto ? Number(minMonto) : undefined,
+      maxMonto: maxMonto ? Number(maxMonto) : undefined,
+      region,
+      provincia,
+      distrito,
+      cumplePlantel,
+      search,
       orderBy: orderBy || "score",
       direction: direction || "desc",
       limit: Math.min(Number(limit) || 50, 500),
       offset: Number(offset) || 0,
     });
     res.json(result);
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+// GET /api/v2/ubicaciones — devuelve regiones/provincias/distritos distintas para filtros
+app.get("/api/v2/ubicaciones", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const ub = await sb.getUbicacionesDistintas();
+    res.json(ub);
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+// GET /api/v2/empresa — perfil de la empresa activa (incluye personal)
+app.get("/api/v2/empresa", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const empresa = await sb.getEmpresaActiva();
+    if (!empresa) return res.status(404).json({ error: "empresa no encontrada" });
+    res.json(empresa);
   } catch (e) {
     sendError(res, req, e);
   }

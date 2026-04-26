@@ -27,6 +27,155 @@ function experienciaAcumulada(empresa, { antiguedadMaxAnios = null, tipos = [] }
 }
 
 /**
+ * Normaliza string para matching laxo (lowercase, sin tildes).
+ */
+function normLower(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
+
+/**
+ * Match heurístico rol requerido vs persona empresa.
+ * Score: profesión exacta + especialidad keyword en rol + experiencia >= req.
+ */
+// alias para matchear keywords variantes en el rol
+const ESPECIALIDAD_ALIAS = {
+  saneamiento: ["sanitar", "sanitaria", "saneamient", "agua", "alcantarillad"],
+  estructuras: ["estructur", "concreto", "armado"],
+  suelos: ["suelo", "geotecnic", "mecanica de suelos"],
+  electricas: ["electric", "electromec"],
+  arquitectura: ["arquitect"],
+  residente: ["residente", "jefe de obra"],
+  costos: ["costo", "metrad", "presupuesto", "valoriz"],
+  seguridad: ["seguridad", "sst", "salud ocupac"],
+};
+
+function matchRolToPersona(reqRol, persona) {
+  const rolN = normLower(reqRol.rol);
+  const expReqGeneral = reqRol.expGeneralMeses || 0;
+  const expReqEspec = reqRol.expEspecificaMeses || 0;
+  const profReq = normLower(reqRol.profesion);
+  const profP = normLower(persona.profesion);
+  const espP = normLower(persona.especialidad);
+  const expP = persona.expMeses || 0;
+
+  // 1. profesión debe coincidir si está especificada
+  let profMatched = true;
+  if (profReq && profP) {
+    profMatched = profP.includes(profReq) || profReq.includes(profP);
+    if (!profMatched) return null;
+  }
+
+  // 2. experiencia general suficiente
+  if (expReqGeneral && expP < expReqGeneral) return null;
+
+  // 3. matching especialidad (laxo):
+  //    a) keyword directo de especialidad en rol
+  //    b) keyword alias en rol
+  //    c) profesión coincidió + rol no especifica subespecialidad → OK
+  let especialidadMatch = false;
+  let scoreMatch = 0;
+  if (espP) {
+    if (rolN.includes(espP)) {
+      especialidadMatch = true;
+      scoreMatch = 3;
+    } else {
+      const aliases = ESPECIALIDAD_ALIAS[espP] || [];
+      if (aliases.some((a) => rolN.includes(a))) {
+        especialidadMatch = true;
+        scoreMatch = 2;
+      }
+    }
+  }
+  // si rol genérico (residente, asistente) y profesión coincide → match
+  if (!especialidadMatch && profMatched && profReq) {
+    const generico = /residente|asistente|jefe|supervisor|inspector|coordinador/.test(rolN);
+    if (generico) {
+      especialidadMatch = true;
+      scoreMatch = 1;
+    }
+  }
+  // si rol no menciona especialidad pero profesión coincide
+  if (!especialidadMatch && profMatched && profReq) {
+    const tieneSubespec = /especialista|esp\.|especialidad/.test(rolN);
+    if (!tieneSubespec) {
+      especialidadMatch = true;
+      scoreMatch = 1;
+    }
+  }
+
+  if (!especialidadMatch) return null;
+
+  // 4. experiencia específica: si persona >= req → cumple
+  const cumpleEspec = expReqEspec ? expP >= expReqEspec : true;
+
+  return {
+    persona: persona.nombres,
+    cumple: cumpleEspec,
+    expPersona: expP,
+    expRequerida: { general: expReqGeneral, especifica: expReqEspec },
+    scoreMatch, // mayor = mejor match (3 keyword exacto, 2 alias, 1 profesión solo)
+  };
+}
+
+/**
+ * Evalúa si la empresa puede cumplir el plantel requerido.
+ * @returns {{cumple: 'si'|'parcial'|'no', cubiertos, faltantes, asignaciones}}
+ */
+function evaluarPlantel(plantelReq, personal) {
+  if (!plantelReq?.length) {
+    return { cumple: "si", cubiertos: 0, total: 0, faltantes: [], asignaciones: [] };
+  }
+  if (!personal?.length) {
+    return {
+      cumple: "no",
+      cubiertos: 0,
+      total: plantelReq.length,
+      faltantes: plantelReq.map((r) => r.rol),
+      asignaciones: [],
+    };
+  }
+
+  const usados = new Set(); // dni o nombres
+  const asignaciones = [];
+  const faltantes = [];
+
+  for (const req of plantelReq) {
+    let mejorMatch = null;
+    for (const p of personal) {
+      const key = p.dni || p.nombres;
+      if (usados.has(key)) continue;
+      const m = matchRolToPersona(req, p);
+      if (!m) continue;
+      // ranking: scoreMatch desempata por experiencia
+      const isBetter =
+        !mejorMatch ||
+        m.scoreMatch > mejorMatch.scoreMatch ||
+        (m.scoreMatch === mejorMatch.scoreMatch && m.expPersona > mejorMatch.expPersona);
+      if (isBetter) {
+        mejorMatch = { ...m, key, rol: req.rol };
+      }
+    }
+    if (mejorMatch) {
+      usados.add(mejorMatch.key);
+      asignaciones.push(mejorMatch);
+    } else {
+      faltantes.push(req.rol);
+    }
+  }
+
+  const cubiertos = asignaciones.length;
+  const total = plantelReq.length;
+  let cumple = "no";
+  if (cubiertos === total) cumple = "si";
+  else if (cubiertos >= Math.ceil(total / 2)) cumple = "parcial";
+
+  return { cumple, cubiertos, total, faltantes, asignaciones };
+}
+
+/**
  * API principal.
  *
  * @param {object} requisitos — output de analizarRequisitos()
@@ -109,10 +258,34 @@ export function evaluarProceso(requisitos, empresa, opts = {}) {
     };
   }
 
+  // 6. plantel profesional
+  const plantelReq = requisitos?.plantel || [];
+  const evalPlantel = evaluarPlantel(plantelReq, empresa.personal || []);
+  datos.plantel = evalPlantel;
+  if (plantelReq.length) {
+    if (evalPlantel.cumple === "no") {
+      razones.push(
+        `Plantel profesional: 0/${evalPlantel.total} roles cubiertos (faltan: ${evalPlantel.faltantes.join(", ")})`
+      );
+    } else if (evalPlantel.cumple === "parcial") {
+      razones.push(
+        `Plantel profesional: ${evalPlantel.cubiertos}/${evalPlantel.total} roles cubiertos (faltan: ${evalPlantel.faltantes.join(", ")})`
+      );
+    } else {
+      razones.push(`Plantel profesional: ${evalPlantel.cubiertos}/${evalPlantel.total} roles cubiertos.`);
+    }
+    // si plantel falta y resultado era califica → bajar a consorcio
+    if (resultado === "califica" && evalPlantel.cumple === "no") {
+      resultado = "consorcio";
+      razones.push("Monto califica pero falta plantel completo. Considerar consorcio o subcontratar especialistas.");
+    }
+  }
+
   return {
     resultado, // 'califica' | 'consorcio' | 'no_califica' | 'indeterminado'
     razones,
     datos,
     sugerenciaConsorcio,
+    plantel: evalPlantel,
   };
 }

@@ -76,6 +76,10 @@ export function createSupabaseStore() {
         objeto: p.objeto,
         valor_referencial: p.valorReferencial,
         moneda: p.moneda,
+        region: p.region,
+        provincia: p.provincia,
+        distrito: p.distrito,
+        lugar_ejecucion: p.lugarEjecucion,
         fecha_publicacion: p.fechaPublicacion,
         fecha_propuesta: p.fechaPropuesta,
         dias_restantes: p.diasRestantes,
@@ -85,6 +89,7 @@ export function createSupabaseStore() {
         calidad_texto: p.calidadTexto,
         llm_used: p.llmUsed,
         requisitos: p.requisitos,
+        plantel: p.plantel || [],
         evaluacion: p.evaluacion,
         warnings: p.warnings,
         score: p.score,
@@ -160,6 +165,13 @@ export function createSupabaseStore() {
       estado,
       minScore,
       minDias,
+      minMonto,
+      maxMonto,
+      region,
+      provincia,
+      distrito,
+      cumplePlantel,    // 'si' | 'parcial' | 'no'
+      search,           // búsqueda libre en nomenclatura/entidad
       orderBy = "score",
       direction = "desc",
       limit = 100,
@@ -170,10 +182,44 @@ export function createSupabaseStore() {
       if (estado) q = q.eq("estado", estado);
       if (minScore != null) q = q.gte("score", minScore);
       if (minDias != null) q = q.gte("dias_restantes", minDias);
+      if (minMonto != null) q = q.gte("valor_referencial", minMonto);
+      if (maxMonto != null) q = q.lte("valor_referencial", maxMonto);
+      if (region) q = q.ilike("region", region);
+      if (provincia) q = q.ilike("provincia", provincia);
+      if (distrito) q = q.ilike("distrito", distrito);
+      if (cumplePlantel) q = q.eq("evaluacion->plantel->>cumple", cumplePlantel);
+      if (search) {
+        const s = `%${search}%`;
+        q = q.or(`nomenclatura.ilike.${s},entidad.ilike.${s},descripcion.ilike.${s}`);
+      }
       q = q.order(orderBy, { ascending: direction === "asc" }).range(offset, offset + limit - 1);
       const { data, error, count } = await q;
       if (error) throw error;
       return { data: data || [], total: count || 0 };
+    },
+
+    /**
+     * Devuelve regiones/provincias/distritos distintos para alimentar filtros UI.
+     */
+    async getUbicacionesDistintas() {
+      const { data, error } = await supabase
+        .from("procesos_latest")
+        .select("region, provincia, distrito")
+        .not("region", "is", null);
+      if (error) throw error;
+      const regiones = new Set();
+      const provincias = new Set();
+      const distritos = new Set();
+      for (const r of data || []) {
+        if (r.region) regiones.add(r.region);
+        if (r.provincia) provincias.add(r.provincia);
+        if (r.distrito) distritos.add(r.distrito);
+      }
+      return {
+        regiones: [...regiones].sort(),
+        provincias: [...provincias].sort(),
+        distritos: [...distritos].sort(),
+      };
     },
 
     async getDocumentos(nidProceso) {
@@ -205,6 +251,7 @@ export function createSupabaseStore() {
         capacidadContratacionCAPECO: Number(data.capacidad_contratacion_capeco),
         especialidades: data.especialidades || [],
         experiencia: data.experiencia || [],
+        personal: data.personal || [],
       };
     },
 

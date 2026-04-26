@@ -36,5 +36,49 @@
       "tipo": "edificacion",
       "anio": 2024
     }
+  ],
+  "personal": [
+    {
+      "nombres": "Ing. Juan Pérez",
+      "profesion": "Ingeniero Civil",
+      "expMeses": 120,
+      "especialidad": "residente",
+      "dni": "40000001"
+    },
+    {
+      "nombres": "Ing. María García",
+      "profesion": "Ingeniero Civil",
+      "expMeses": 96,
+      "especialidad": "estructuras",
+      "dni": "40000002"
+    },
+    {
+      "nombres": "Ing. Carlos López",
+      "profesion": "Ingeniero Civil",
+      "expMeses": 72,
+      "especialidad": "suelos",
+      "dni": "40000003"
+    },
+    {
+      "nombres": "Ing. Rosa Vega",
+      "profesion": "Ingeniero Sanitario",
+      "expMeses": 84,
+      "especialidad": "saneamiento",
+      "dni": "40000004"
+    },
+    {
+      "nombres": "Ing. Pedro Quispe",
+      "profesion": "Ingeniero Eléctrico",
+      "expMeses": 60,
+      "especialidad": "electricas",
+      "dni": "40000005"
+    },
+    {
+      "nombres": "Ing. Lucia Torres",
+      "profesion": "Arquitecto",
+      "expMeses": 108,
+      "especialidad": "arquitectura",
+      "dni": "40000006"
+    }
   ]
 }
