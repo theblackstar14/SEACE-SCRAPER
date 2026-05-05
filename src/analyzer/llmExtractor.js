@@ -137,7 +137,12 @@ export async function extractRequisitosWithClaudePdf(buffer, { valorReferencial 
 
   const trunc = await truncateForClaude(buffer, { maxPages: 40 });
 
-  const userText = `Analiza este documento de Bases SEACE y extrae los requisitos de calificación del postor.
+  const userText = `Analiza este documento de Bases SEACE y extrae TODOS los campos del tool, incluyendo:
+
+1. **Requisitos de experiencia del postor** (monto en S/, tipos de obra similar, antigüedad).
+2. **Plantel profesional COMPLETO** (sección "B. CAPACIDAD TÉCNICA Y PROFESIONAL" o "PLANTEL PROFESIONAL CLAVE"). Lista CADA cargo con su experiencia general/específica en meses. Roles típicos: Residente de Obra, Especialista en Estructuras, Especialista en Suelos, Especialista en Sanitarias, Especialista en Eléctricas, Asistente Técnico. Si la sección existe, NUNCA dejes el array vacío.
+3. **Lugar de ejecución** (Capítulo I, sección 1.5 o equivalente). Texto literal: "Distrito X, Provincia Y, Departamento Z".
+
 ${valorReferencial ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")} (no confundir con la experiencia requerida).` : ""}
 ${trunc.wasCropped ? `\nNota: el documento original es grande (${Math.round(trunc.originalSize / 1024 / 1024)}MB, ${trunc.totalPages} páginas). Se te envían las primeras ${trunc.pagesIncluded} páginas.` : ""}
 
@@ -146,7 +151,7 @@ Si son Bases Integradas con montos reales, extrae con precisión y confianza≥0
 
   const message = await createMessage({
     model: defaultModel(),
-    max_tokens: 1024,
+    max_tokens: 2048,
     system: SYSTEM_PROMPT,
     tools: [EXTRACCION_TOOL],
     tool_choice: { type: "tool", name: EXTRACCION_TOOL.name },
@@ -187,44 +192,113 @@ export async function extractRequisitosWithClaudeText(text, { valorReferencial =
     throw new Error("ANTHROPIC_API_KEY no configurada");
   }
 
-  const MAX_CHARS = 40000;
+  // Multi-window strategy: si el doc es grande, enviamos varios fragmentos clave concatenados
+  // (lugar de ejecución + sección requisitos + plantel) en lugar de un solo slice.
+  const MAX_CHARS = 120000;
   const truncated = text.length > MAX_CHARS;
   let textSlice = text;
   if (truncated) {
     const tlow = text.toLowerCase();
-    const anchors = [
-      "requisitos de calificaci",
-      "requisitos de calif",
-      "experiencia del postor",
-      "capítulo iii",
-      "capitulo iii",
-    ];
-    let anchorIdx = -1;
-    for (const a of anchors) {
-      const idx = tlow.indexOf(a);
-      if (idx >= 0) { anchorIdx = idx; break; }
+
+    // 1. Encuentra todos los puntos de interés
+    const findAll = (needle) => {
+      const out = [];
+      let i = 0;
+      while ((i = tlow.indexOf(needle, i)) >= 0) { out.push(i); i += needle.length; }
+      return out;
+    };
+    const reqIdx       = [...findAll("requisitos de calificaci"), ...findAll("requisitos de calif")];
+    const expPostorIdx = findAll("experiencia del postor");
+    const capTecIdx    = [...findAll("capacidad técnica y profesional"), ...findAll("capacidad tecnica y profesional")];
+    const planIdx      = findAll("plantel profesional");
+    const lugarIdx     = findAll("lugar de ejecuci");
+    const cap3Idx      = [...findAll("capítulo iii"), ...findAll("capitulo iii")];
+
+    // 2. Construye ventanas (cada una ~25k chars max) priorizando secciones reales
+    //    de la "Sección Específica" (no las del template/TOC). Heurística:
+    //    - cap III en la SEGUNDA mitad del documento es probablemente real
+    //    - cap III en la PRIMERA mitad es TOC
+    const halfLen = text.length / 2;
+    const windows = [];
+    const addWindow = (idx, before, after, label) => {
+      if (idx < 0) return;
+      const start = Math.max(0, idx - before);
+      const end = Math.min(text.length, idx + after);
+      windows.push({ start, end, label });
+    };
+
+    // ventana lugar (al inicio del PDF)
+    if (lugarIdx[0] != null) addWindow(lugarIdx[0], 500, 1500, "lugar_ejecucion");
+
+    // ventana cap III real (preferir occurrence en segunda mitad)
+    const cap3Real = cap3Idx.find(i => i > halfLen) ?? cap3Idx[cap3Idx.length - 1];
+    if (cap3Real != null) addWindow(cap3Real, 2000, 30000, "capitulo_iii");
+
+    // ventana experiencia del postor (más específica)
+    const expReal = expPostorIdx.find(i => i > halfLen) ?? expPostorIdx[0];
+    if (expReal != null) addWindow(expReal, 2000, 15000, "experiencia_postor");
+
+    // ventana capacidad técnica y profesional (plantel)
+    const capTecReal = capTecIdx.find(i => i > halfLen) ?? capTecIdx[0];
+    if (capTecReal != null) addWindow(capTecReal, 1500, 12000, "plantel");
+
+    // ventana plantel profesional explícito
+    if (planIdx[0] != null) addWindow(planIdx[0], 500, 8000, "plantel_explicit");
+
+    // ventana requisitos calificación (último intento)
+    const reqReal = reqIdx.find(i => i > halfLen) ?? reqIdx[0];
+    if (reqReal != null) addWindow(reqReal, 1500, 12000, "requisitos");
+
+    // 3. Mergear ventanas que se solapan
+    windows.sort((a, b) => a.start - b.start);
+    const merged = [];
+    for (const w of windows) {
+      const last = merged[merged.length - 1];
+      if (last && w.start <= last.end + 500) {
+        last.end = Math.max(last.end, w.end);
+        last.label += `+${w.label}`;
+      } else {
+        merged.push({ ...w });
+      }
     }
-    if (anchorIdx >= 0) {
-      const start = Math.max(0, anchorIdx - 5000);
-      const end = Math.min(text.length, start + MAX_CHARS);
-      textSlice = text.slice(start, end);
+
+    // 4. Construir slice respetando MAX_CHARS
+    const parts = [];
+    let totalChars = 0;
+    for (const w of merged) {
+      const len = w.end - w.start;
+      if (totalChars + len > MAX_CHARS) {
+        const remaining = MAX_CHARS - totalChars;
+        if (remaining < 1000) break;
+        parts.push(`\n\n[FRAGMENTO ${w.label}]\n${text.slice(w.start, w.start + remaining)}`);
+        break;
+      }
+      parts.push(`\n\n[FRAGMENTO ${w.label}]\n${text.slice(w.start, w.end)}`);
+      totalChars += len;
+    }
+
+    if (parts.length > 0) {
+      textSlice = parts.join("");
     } else {
       textSlice = text.slice(0, MAX_CHARS);
     }
   }
 
-  const userText = `Texto extraído de las Bases SEACE (PDF plano):
+  const userText = `Texto extraído de las Bases SEACE (proceso de obra):
 ---
 ${textSlice}
 ---
 ${truncated ? `\n[texto truncado — ${text.length} chars totales, enviados ${textSlice.length}]` : ""}
 ${valorReferencial ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")}.` : ""}
 
-Extrae los requisitos de calificación del postor.`;
+Extrae TODOS los campos del tool:
+1. Requisitos de experiencia del postor.
+2. **Plantel profesional COMPLETO** — sección "B. CAPACIDAD TÉCNICA Y PROFESIONAL" o "PLANTEL PROFESIONAL CLAVE". Lista CADA rol con experiencia en meses. Si la sección existe, NUNCA dejes el array vacío.
+3. **Lugar de ejecución** — texto literal de la sección 1.5.`;
 
   const message = await createMessage({
     model: defaultModel(),
-    max_tokens: 1024,
+    max_tokens: 2048,
     system: SYSTEM_PROMPT,
     tools: [EXTRACCION_TOOL],
     tool_choice: { type: "tool", name: EXTRACCION_TOOL.name },
@@ -262,7 +336,12 @@ export async function extractRequisitosWithGeminiPdf(buffer, { valorReferencial 
   const sizeMB = Math.round(buffer.length / 1024 / 1024);
   const base64 = buffer.toString("base64");
 
-  const userText = `Analiza este PDF de Bases SEACE (proceso de obra) y extrae los requisitos de calificación del postor.
+  const userText = `Analiza este PDF de Bases SEACE (proceso de obra). Extrae TODOS los campos del schema:
+
+1. **Requisitos de experiencia del postor** (monto en S/, tipos de obra similar, antigüedad).
+2. **Plantel profesional COMPLETO** — sección "B. CAPACIDAD TÉCNICA Y PROFESIONAL" o "PLANTEL PROFESIONAL CLAVE". Lista CADA rol (Residente, Especialistas) con su experiencia general/específica en meses. Si la sección existe, NUNCA dejes el array vacío.
+3. **Lugar de ejecución** — Capítulo I sección 1.5. Texto literal "Distrito X, Provincia Y, Departamento Z".
+
 ${valorReferencial ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")} (no confundir con la experiencia requerida).` : ""}
 
 Si es una Bases Estándar SIN rellenar (tiene placeholders [CONSIGNAR...], [ABC]), indica es_bases_integradas=false y confianza≤0.3.
@@ -315,7 +394,10 @@ ${textSlice}
 ${truncated ? `\n[texto truncado — ${text.length} chars totales]` : ""}
 ${valorReferencial ? `\nValor Referencial del proceso: S/ ${valorReferencial.toLocaleString("es-PE")}.` : ""}
 
-Extrae los requisitos de calificación del postor.`;
+Extrae TODOS los campos del schema:
+1. Requisitos de experiencia del postor.
+2. **Plantel profesional COMPLETO** — sección "B. CAPACIDAD TÉCNICA Y PROFESIONAL". Lista CADA rol con experiencia en meses. NUNCA dejes el array vacío si la sección existe.
+3. **Lugar de ejecución** — sección 1.5, texto literal.`;
 
   const result = await generateStructured({
     contents: [{ role: "user", parts: [{ text: userText }] }],

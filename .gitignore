@@ -1,9 +1,14 @@
-node_modules
+node_modules/
 .env
 .env.*
 !.env.example
 *.log
 error.png
-.vscode
-.idea
+.vscode/
+.idea/
 .DS_Store
+cloudflared.exe
+.claude/
+data/cache/
+data/debug/
+data/output/

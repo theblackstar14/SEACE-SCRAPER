@@ -66,6 +66,45 @@ export const REQUISITOS_SCHEMA = {
       type: SchemaType.BOOLEAN,
       description: "true si el doc tiene los requisitos finales rellenos. false si es template.",
     },
+    plantel_profesional: {
+      type: SchemaType.ARRAY,
+      description: "Lista de profesionales clave requeridos (sección B. CAPACIDAD TÉCNICA Y PROFESIONAL). Cada item es un cargo. Vacío si no hay sección.",
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          rol: {
+            type: SchemaType.STRING,
+            description: "Cargo exacto: Residente de Obra, Especialista en Estructuras, Especialista en Suelos, Especialista en Sanitarias, Especialista en Eléctricas, etc.",
+          },
+          profesion: {
+            type: SchemaType.STRING,
+            description: "Profesión: Ingeniero Civil, Ingeniero Sanitario, Arquitecto, etc.",
+            nullable: true,
+          },
+          experiencia_general_meses: {
+            type: SchemaType.NUMBER,
+            description: "Experiencia general mínima en meses (60-120 típico).",
+            nullable: true,
+          },
+          experiencia_especifica_meses: {
+            type: SchemaType.NUMBER,
+            description: "Experiencia específica/efectiva mínima en meses (24-48 típico).",
+            nullable: true,
+          },
+          experiencia_especifica_en: {
+            type: SchemaType.STRING,
+            description: "En qué debe ser la experiencia específica.",
+            nullable: true,
+          },
+        },
+        required: ["rol"],
+      },
+    },
+    lugar_ejecucion: {
+      type: SchemaType.STRING,
+      description: "Texto literal de la sección 1.5 LUGAR DE EJECUCIÓN. Ejemplo: 'Distrito de Pachacámac, Provincia de Lima, Departamento de Lima'.",
+      nullable: true,
+    },
     confianza: {
       type: SchemaType.NUMBER,
       description: "Qué tan seguro estás de la extracción (0.0 a 1.0).",
@@ -98,8 +137,10 @@ Claves:
 - Los requisitos de calificación viven en el Capítulo III — típicamente a mitad del documento.
 - Experiencia del postor: "monto acumulado no menor a S/ X" o "equivalente a N veces el valor referencial".
 - NO confundir VR/Valor Referencial/Cuantía con la experiencia requerida — son distintos.
+- Plantel profesional: sección "B. CAPACIDAD TÉCNICA Y PROFESIONAL" o "PLANTEL PROFESIONAL CLAVE". Lista CADA cargo (Residente, Especialistas) con experiencia en meses. Si la sección existe, NUNCA dejes el array vacío.
+- Lugar de ejecución: sección 1.5 del Capítulo I. Indica distrito/provincia/departamento.
 
-Siempre responde con JSON estructurado según el schema.`;
+Siempre responde con JSON estructurado según el schema. Extrae TODOS los campos.`;
 
 /**
  * Genera contenido estructurado con Gemini.
@@ -119,7 +160,7 @@ export async function generateStructured(opts) {
       responseMimeType: "application/json",
       responseSchema: opts.schema || REQUISITOS_SCHEMA,
       temperature: opts.temperature ?? 0.1,
-      maxOutputTokens: opts.maxOutputTokens || 2048,
+      maxOutputTokens: opts.maxOutputTokens || 8192, // bumped: plantel + citas pueden ser largos
     },
   });
 
@@ -133,7 +174,33 @@ export async function generateStructured(opts) {
   try {
     parsed = JSON.parse(text);
   } catch (e) {
-    throw new Error(`Gemini no devolvió JSON válido: ${text.slice(0, 200)}`);
+    // intenta limpiar markdown wrappers (```json ... ```)
+    const cleaned = text
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```\s*$/, "")
+      .trim();
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e2) {
+      // último intento: buscar JSON dentro del texto
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) {
+        try {
+          parsed = JSON.parse(match[0]);
+        } catch (e3) {
+          const finishReason = response.candidates?.[0]?.finishReason;
+          const truncated = finishReason === "MAX_TOKENS";
+          throw new Error(
+            `Gemini JSON inválido (finishReason=${finishReason}${truncated ? ", TRUNCADO" : ""}): ${text.slice(0, 300)}`
+          );
+        }
+      } else {
+        const finishReason = response.candidates?.[0]?.finishReason;
+        throw new Error(
+          `Gemini JSON inválido (finishReason=${finishReason}): ${text.slice(0, 300)}`
+        );
+      }
+    }
   }
 
   return {

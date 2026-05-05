@@ -262,22 +262,19 @@ export function evaluarProceso(requisitos, empresa, opts = {}) {
   const plantelReq = requisitos?.plantel || [];
   const evalPlantel = evaluarPlantel(plantelReq, empresa.personal || []);
   datos.plantel = evalPlantel;
+  // Plantel profesional = info, NO degrada resultado.
+  // Personal se subcontrata o se contrata según el proceso.
   if (plantelReq.length) {
     if (evalPlantel.cumple === "no") {
       razones.push(
-        `Plantel profesional: 0/${evalPlantel.total} roles cubiertos (faltan: ${evalPlantel.faltantes.join(", ")})`
+        `Plantel profesional (info): 0/${evalPlantel.total} cubiertos por personal actual — contratar/subcontratar: ${evalPlantel.faltantes.join(", ")}`
       );
     } else if (evalPlantel.cumple === "parcial") {
       razones.push(
-        `Plantel profesional: ${evalPlantel.cubiertos}/${evalPlantel.total} roles cubiertos (faltan: ${evalPlantel.faltantes.join(", ")})`
+        `Plantel profesional (info): ${evalPlantel.cubiertos}/${evalPlantel.total} cubiertos por personal actual — contratar/subcontratar: ${evalPlantel.faltantes.join(", ")}`
       );
     } else {
-      razones.push(`Plantel profesional: ${evalPlantel.cubiertos}/${evalPlantel.total} roles cubiertos.`);
-    }
-    // si plantel falta y resultado era califica → bajar a consorcio
-    if (resultado === "califica" && evalPlantel.cumple === "no") {
-      resultado = "consorcio";
-      razones.push("Monto califica pero falta plantel completo. Considerar consorcio o subcontratar especialistas.");
+      razones.push(`Plantel profesional: ${evalPlantel.cubiertos}/${evalPlantel.total} cubiertos por personal actual.`);
     }
   }
 

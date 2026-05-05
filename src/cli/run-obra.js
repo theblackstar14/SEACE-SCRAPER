@@ -111,7 +111,8 @@ async function main() {
       : `ON forced ${llmProvider}`;
 
   const minDias = args.minDias ?? 15;
-  const maxMontoRatio = args.maxMontoRatio ?? 2;
+  // Default 10× (solo descarta gigantes obvios). ERP filtra dinámico por capacidad.
+  const maxMontoRatio = args.maxMontoRatio ?? 10;
   const maxPubDias = args.maxPubDias ?? 30;
   const maxDocMB = args.maxDocMB ?? 50;
 

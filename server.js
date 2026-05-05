@@ -308,6 +308,18 @@ app.get("/api/v2/empresa", async (req, res) => {
   }
 });
 
+// PUT /api/v2/empresa — actualiza empresa activa (CRUD básico)
+app.put("/api/v2/empresa", async (req, res) => {
+  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+  try {
+    const sb = createSupabaseStore();
+    const updated = await sb.updateEmpresaActiva(req.body);
+    res.json(updated);
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
 // GET /api/v2/procesos/:nidProceso
 // Detalle completo del último análisis de un proceso, con documentos.
 app.get("/api/v2/procesos/:nidProceso", async (req, res) => {

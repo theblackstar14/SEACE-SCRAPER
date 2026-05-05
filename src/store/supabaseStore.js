@@ -255,6 +255,46 @@ export function createSupabaseStore() {
       };
     },
 
+    /**
+     * Actualiza la empresa activa con los campos del payload.
+     */
+    async updateEmpresaActiva(payload) {
+      const { data: existing } = await supabase
+        .from("empresas")
+        .select("id")
+        .eq("activa", true)
+        .order("id")
+        .limit(1)
+        .maybeSingle();
+      if (!existing) throw new Error("empresa activa no encontrada");
+
+      const updates = {};
+      if (payload.razonSocial !== undefined) updates.razon_social = payload.razonSocial;
+      if (payload.ruc !== undefined) updates.ruc = payload.ruc;
+      if (payload.capacidadContratacionCAPECO !== undefined)
+        updates.capacidad_contratacion_capeco = Number(payload.capacidadContratacionCAPECO);
+      if (payload.especialidades !== undefined) updates.especialidades = payload.especialidades;
+      if (payload.experiencia !== undefined) updates.experiencia = payload.experiencia;
+      if (payload.personal !== undefined) updates.personal = payload.personal;
+
+      const { data, error } = await supabase
+        .from("empresas")
+        .update(updates)
+        .eq("id", existing.id)
+        .select()
+        .single();
+      if (error) throw new Error(`empresa update: ${error.message}`);
+
+      return {
+        razonSocial: data.razon_social,
+        ruc: data.ruc,
+        capacidadContratacionCAPECO: Number(data.capacidad_contratacion_capeco),
+        especialidades: data.especialidades || [],
+        experiencia: data.experiencia || [],
+        personal: data.personal || [],
+      };
+    },
+
     newRunId() {
       const d = new Date();
       const tag = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;

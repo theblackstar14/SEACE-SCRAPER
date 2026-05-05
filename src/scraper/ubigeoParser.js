@@ -165,16 +165,23 @@ export function parseUbicacionMixed(entidad, lugarEjecucion = null) {
 
   if (lugarEjecucion) {
     const t = norm(lugarEjecucion);
-    // pattern típico: "Distrito de X, Provincia de Y, Departamento de Z"
-    let m = t.match(/DEPARTAMENTO\s+(?:DE\s+)?([A-ZÑ\s]+?)(?:[,\.]|$)/);
+    // patterns:
+    //   "Distrito de X, Provincia de Y, Departamento de Z"
+    //   "Departamento: X, Provincia: Y, Distrito: Z"
+    let m = t.match(/DEPARTAMENTO\s*:?\s*(?:DE\s+)?([A-ZÑ\s]+?)(?:[,\.\:]|$)/);
     if (m) {
       const r = resolveFromRegion(m[1].trim());
       if (r.region) return r;
     }
-    m = t.match(/DISTRITO\s+(?:DE\s+)?([A-ZÑ\s]+?)(?:[,\.]|$)/);
+    m = t.match(/DISTRITO\s*:?\s*(?:DE\s+)?([A-ZÑ\s]+?)(?:[,\.\:]|$)/);
     if (m) {
       const r = resolveFromDistrito(m[1].trim());
       if (r.region || r.provincia) return r;
+    }
+    m = t.match(/PROVINCIA\s*:?\s*(?:DE\s+)?([A-ZÑ\s]+?)(?:[,\.\:]|$)/);
+    if (m) {
+      const r = resolveFromProvincia(m[1].trim());
+      if (r.region) return r;
     }
   }
 

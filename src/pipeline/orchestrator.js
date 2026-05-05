@@ -171,6 +171,20 @@ async function dumpText(nomenclatura, text, meta) {
  *   - callClaude: async () => result
  *   - callGemini: async () => result
  */
+/**
+ * Determina si un resultado LLM es "débil" (probablemente no extrajo bien).
+ * Si es débil y hay otro provider, vale la pena reintentar.
+ */
+function isWeakResult(r) {
+  if (!r) return true;
+  const sinMonto = r.experienciaMonto == null;
+  const sinPlantel = !r.plantel || r.plantel.length === 0;
+  const sinLugar = !r.lugarEjecucion;
+  const bajaConfianza = (r.confianza ?? 0) < 0.4;
+  // débil si NADA crítico se extrajo
+  return sinMonto && sinPlantel && sinLugar;
+}
+
 async function tryLlmWithFallback({ preferredProvider, callClaude, callGemini }) {
   const { isLlmAvailable } = await import("../llm/claude.js");
   const { isGeminiAvailable } = await import("../llm/gemini.js");
@@ -184,26 +198,41 @@ async function tryLlmWithFallback({ preferredProvider, callClaude, callGemini })
     order.push({ name: "claude", fn: callClaude });
     if (isGeminiAvailable()) order.push({ name: "gemini", fn: callGemini });
   } else {
-    // auto: el que esté
     if (isLlmAvailable()) order.push({ name: "claude", fn: callClaude });
     if (isGeminiAvailable()) order.push({ name: "gemini", fn: callGemini });
   }
 
-  for (const { name, fn } of order) {
+  let firstWeakResult = null;
+  let firstWeakProvider = null;
+
+  for (let i = 0; i < order.length; i++) {
+    const { name, fn } = order[i];
     try {
       const result = await fn();
+      // Si el resultado es débil Y hay otro provider disponible, reintentar
+      if (isWeakResult(result) && i < order.length - 1) {
+        console.warn(`[llm ${name} WEAK] sin datos extraíbles → fallback a ${order[i + 1].name}`);
+        errors.push({ provider: name, error: "resultado débil (no monto/plantel/lugar) — fallback", fatal: false });
+        firstWeakResult = result;
+        firstWeakProvider = name;
+        continue;
+      }
+      // Si el segundo también devolvió débil, usa el mejor (preferimos el segundo si tiene algo)
+      if (isWeakResult(result) && firstWeakResult) {
+        // ambos débiles: devolvemos el primero (probablemente más rápido)
+        return { result: firstWeakResult, providerUsed: firstWeakProvider, errors };
+      }
       return { result, providerUsed: name, errors };
     } catch (e) {
       const msg = String(e.message || e);
       const depleted = /credits.*depleted|quota|insufficient|billing/i.test(msg);
-      const rateLimit = /429|rate.?limit|too many/i.test(msg);
       console.warn(`[llm ${name} FAIL] ${msg.slice(0, 200)}`);
       errors.push({ provider: name, error: msg.slice(0, 300), fatal: depleted });
-      // si el error es creds/billing, NO reintentar con mismo provider luego
-      // pero sí con el otro (próxima iteración del loop)
     }
   }
 
+  // si todos fallaron pero tenemos al menos un débil, devolverlo
+  if (firstWeakResult) return { result: firstWeakResult, providerUsed: firstWeakProvider, errors };
   return { result: null, providerUsed: null, errors };
 }
 
@@ -301,20 +330,44 @@ function analizarCalidadTexto(text, meta) {
     return flags;
   }
 
-  // marcador inequívoco del template SEACE Bases Estándar (sin montos rellenos)
+  // Detección template: requiere MÚLTIPLES placeholders reales (no solo título)
+  // Y ningún monto específico en cualquier parte del documento.
   const tlow = text.toLowerCase();
-  const hasPlaceholder =
-    tlow.includes("[consignar nomenclatura del procedimiento") ||
-    tlow.includes("[consignar aquí") ||
-    tlow.includes("[consignar el monto") ||
-    tlow.includes("bases estándar licitación pública abreviada");
-  const hasSpecificAmount = /experiencia[^.]{0,150}(no\s*menor\s*a|equivalente\s*a)\s*s\s*\/\s*\.?\s*\d{3,}/i.test(
-    text
-  );
-  if (hasPlaceholder && !hasSpecificAmount) {
+
+  // placeholders REALES (corchetes con instrucciones de llenado)
+  const placeholderPatterns = [
+    /\[consignar nomenclatura/gi,
+    /\[consignar aqu[ií]/gi,
+    /\[consignar el monto/gi,
+    /\[consignar fecha/gi,
+    /\[consignar firma/gi,
+    /\[consignar nombre/gi,
+    /\[indicar\s/gi,
+    /\[completar\s/gi,
+  ];
+  let placeholderCount = 0;
+  for (const p of placeholderPatterns) {
+    const matches = text.match(p);
+    if (matches) placeholderCount += matches.length;
+  }
+
+  // montos específicos en CUALQUIER parte del documento (no solo cerca de "experiencia")
+  // patron: S/ seguido de monto >= 100k
+  const montoMatches = text.match(/s\s*\/\s*\.?\s*[\d,]{6,}(?:\.\d{2})?/gi) || [];
+  const hasSpecificAmount = montoMatches.length >= 3; // al menos 3 montos S/ XXXX
+
+  // experiencia con monto en ventana más amplia (300 chars)
+  const hasExpMonto = /experiencia[\s\S]{0,300}(no\s*menor\s*a|equivalente\s*a|por\s*un\s*monto)\s*s\s*\/\s*\.?\s*[\d,]{6,}/i.test(text);
+
+  // template solo si MUCHOS placeholders (≥5) Y NO hay montos específicos NI experiencia con monto
+  if (placeholderCount >= 5 && !hasSpecificAmount && !hasExpMonto) {
     flags.template = true;
     flags.razonCalidad =
-      "Bases Estándar sin montos rellenos (etapa temprana — reintentar en Integración de Bases)";
+      `Bases Estándar sin rellenar (${placeholderCount} placeholders, sin montos específicos)`;
+  } else if (placeholderCount >= 1 && placeholderCount < 5 && hasSpecificAmount) {
+    // híbrido: integrado pero con anexos sin completar — NO es template
+    flags.bases_mixto = true;
+    flags.razonCalidad = `Bases parcialmente rellenas (${placeholderCount} placeholders en anexos, ${montoMatches.length} montos)`;
   }
 
   return flags;
@@ -597,7 +650,10 @@ export async function runObraPipeline({
         if (llm) {
           analisis.requisitos = mapLlmToRequisitos(llm, { fuente: `${providerUsed}-pdf-ocr` });
           analisis.llmUsed = { via: `${providerUsed}-pdf-ocr`, provider: providerUsed, ...llm.meta };
-          if (!llm.esBasesIntegradas || llm.confianza < 0.3 || llm.experienciaMonto == null) {
+          // Mismo criterio: confiar en datos extraídos con alta confianza
+          const datosReales = llm.experienciaMonto != null && llm.confianza >= 0.7;
+          const integradasNormal = llm.esBasesIntegradas && llm.confianza >= 0.3 && llm.experienciaMonto != null;
+          if (!integradasNormal && !datosReales) {
             analisis.evaluacion = {
               resultado: "indeterminado",
               razones: [
@@ -689,17 +745,13 @@ export async function runObraPipeline({
       };
 
       // decisión: regex suficiente, o llamar a Claude?
+      // NOTA: ahora siempre llamamos LLM si useLlm=true para extraer plantel + lugarEjecucion
+      // (regex no puede). Cache hash dedupea templates idénticos.
       const regexFallo = requisitos.experienciaMonto == null;
       const regexSospechoso = sospecha != null;
-      const esTemplate = analisis.calidadTexto.template; // template con o sin monto
+      const esTemplate = analisis.calidadTexto.template;
       const esTemplateSinMonto = esTemplate && regexFallo;
-      const debeLlm =
-        useLlm &&
-        (llmPolicy === "always" ||
-          regexFallo ||
-          regexSospechoso ||
-          esTemplate || // SIEMPRE Claude en templates (regex puede extraer basura)
-          requisitos.experienciaConfianza < 0.7);
+      const debeLlm = useLlm; // siempre que LLM esté disponible
 
       if (debeLlm) {
         try {
@@ -750,7 +802,14 @@ export async function runObraPipeline({
               fuente: `${provider}-${textOk ? "text" : "pdf"}`,
             });
 
-            if (llm.esBasesIntegradas && llm.confianza >= 0.5) {
+            // Confiar en los datos si fueron extraídos con alta confianza,
+            // incluso si esBasesIntegradas=false (LLM puede ser muy conservador
+            // marcando false porque hay placeholders en anexos, aunque la sección
+            // de requisitos esté rellena).
+            const datosReales = llm.experienciaMonto != null && llm.confianza >= 0.7;
+            const integradasNormal = llm.esBasesIntegradas && llm.confianza >= 0.5;
+
+            if (integradasNormal || datosReales) {
               analisis.evaluacion = evaluarProceso(
                 {
                   experienciaMonto: llm.experienciaMonto,
@@ -761,8 +820,11 @@ export async function runObraPipeline({
                 empresa,
                 { consorcioRatio: 0.5 }
               );
+              const noteFlag = !llm.esBasesIntegradas && datosReales
+                ? ` [LLM marcó esBasesIntegradas=false pero datos reales extraídos]`
+                : "";
               analisis.evaluacion.razones.unshift(
-                `Extracción por ${provider} (confianza ${llm.confianza.toFixed(2)}, citas: ${llm.citas.length})`
+                `Extracción por ${provider} (confianza ${llm.confianza.toFixed(2)}, citas: ${llm.citas.length})${noteFlag}`
               );
             } else {
               analisis.evaluacion = {
