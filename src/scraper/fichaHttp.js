@@ -26,6 +26,14 @@ const normKey = (s) =>
     .replace(/[^\w ]/g, "")
     .trim();
 
+/** Nomenclaturas para comparar: sin espacios, mayúsculas, sin acentos. */
+const normNomen = (s) =>
+  (s || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/\s+/g, "")
+    .toUpperCase();
+
 function fieldByLabels($, labels) {
   const targets = labels.map(normKey);
   let val = "";
@@ -90,7 +98,10 @@ export function parseFichaHtml(html, { nomenclatura, nidProceso } = {}) {
   const documentos = extractDocumentos($);
 
   return {
-    nomenclatura: fieldByLabels($, ["Nomenclatura"]) || nomenclatura,
+    // SIN fallback a la nomenclatura del listado: fetchDetalleHttp compara
+    // este valor contra la pedida para detectar fichas cruzadas, y el
+    // fallback haría que siempre coincidan. El output usa la del listado.
+    nomenclatura: fieldByLabels($, ["Nomenclatura"]),
     nConvocatoria: fieldByLabels($, ["N° Convocatoria", "Nº Convocatoria", "N Convocatoria"]),
     tipoCompra: fieldByLabels($, ["Tipo Compra o Selección", "Tipo Compra o Seleccion"]),
     normativa: fieldByLabels($, ["Normativa Aplicable"]),
@@ -185,6 +196,29 @@ export async function fetchDetalleHttp({ nomenclatura, nidProceso, nidConvocator
   });
 
   const detalle = parseFichaHtml(html, { nomenclatura, nidProceso });
+
+  // GUARD: ¿la ficha que volvió es la que pedimos?
+  //
+  // Los tres bugs de atribución que encontramos (race del ViewState, j_idt
+  // rotado, paginación que no avanzaba) devolvieron HTTP 200 con HTML válido
+  // de OTRO proceso. Nada falla: el pipeline sigue y persiste entidad,
+  // cronograma y documentos cruzados. Se detectó mirando la salida a ojo.
+  // Comparar la nomenclatura del listado contra la de la ficha lo convierte
+  // en un error ruidoso. Tirar el proceso es correcto: dato equivocado es
+  // peor que dato ausente.
+  const pedida = normNomen(nomenclatura);
+  const recibida = normNomen(detalle.nomenclatura);
+  if (pedida && recibida && pedida !== recibida) {
+    console.error(
+      `[ficha MISMATCH] pedí ${nomenclatura} y volvió ${detalle.nomenclatura} ` +
+        `(${detalle.entidad || "?"}) — descartado`
+    );
+    return {
+      _error: `ficha cruzada: pedí ${nomenclatura}, volvió ${detalle.nomenclatura}`,
+      _mismatch: true,
+    };
+  }
+
   detalle._httpStatus = status;
   detalle._httpElapsedMs = elapsedMs;
   detalle._htmlSize = html.length;

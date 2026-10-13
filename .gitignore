@@ -12,3 +12,6 @@ cloudflared.exe
 data/cache/
 data/debug/
 data/output/
+data/docs/
+data/_checkdocs/
+data/state/

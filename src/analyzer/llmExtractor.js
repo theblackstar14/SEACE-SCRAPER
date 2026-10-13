@@ -416,13 +416,22 @@ Extrae TODOS los campos del schema:
 // UTILS
 // ============================================================================
 
+/**
+ * 0 nunca es un requisito válido — ambos LLMs lo devuelven como "no aplica".
+ * Sin esto, reqMonto=0 hace que el evaluador reporte `califica` contra nada.
+ */
+function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 function mapToResult(data, meta) {
   return {
-    experienciaMonto: data.experiencia_monto_pen,
-    experienciaVecesVr: data.experiencia_veces_vr,
+    experienciaMonto: numOrNull(data.experiencia_monto_pen),
+    experienciaVecesVr: numOrNull(data.experiencia_veces_vr),
     tiposObraSimilar: data.tipos_obra_similar || [],
-    antiguedadMaxAnios: data.antiguedad_max_anios,
-    experienciaObrasMin: data.experiencia_obras_min,
+    antiguedadMaxAnios: numOrNull(data.antiguedad_max_anios),
+    experienciaObrasMin: numOrNull(data.experiencia_obras_min),
     esBasesIntegradas: data.es_bases_integradas,
     plantel: (data.plantel_profesional || []).map((p) => ({
       rol: p.rol,

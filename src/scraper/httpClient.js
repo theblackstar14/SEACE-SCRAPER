@@ -13,6 +13,7 @@
 
 import { Pool } from "undici";
 import { CookieJar } from "tough-cookie";
+import pLimit from "p-limit";
 import { config } from "../config/config.js";
 
 const SEACE_HOST = "https://prod2.seace.gob.pe";
@@ -29,6 +30,14 @@ export class SeaceHttpSession {
       connections: 5,
       pipelining: 1,
     });
+    // Un POST en vuelo por sesión. NO es una política de cortesía: el
+    // ViewState de JSF es estado del servidor por sesión, y postForm es un
+    // POST-redirect-GET — el POST fija "la ficha actual" y el GET la lee.
+    // Dos secuencias intercaladas → el GET de una levanta la ficha de la otra.
+    // Medido (scripts/probe-concurrencia.js): con 4 en paralelo, 1 de 4 fichas
+    // salió atribuida al proceso equivocado. Silenciosamente: HTTP 200, HTML
+    // válido, entidad y cronograma de otro proceso.
+    this.lock = pLimit(1);
   }
 
   /**
@@ -69,6 +78,10 @@ export class SeaceHttpSession {
    * @returns {Promise<{html: string, status: number, headers: object}>}
    */
   async postForm(params) {
+    return this.lock(() => this._postForm(params));
+  }
+
+  async _postForm(params) {
     if (!this.viewState) {
       throw new Error("HttpSession sin ViewState — llamar bootstrap primero");
     }

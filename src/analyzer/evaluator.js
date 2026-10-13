@@ -13,13 +13,16 @@
 /**
  * Suma monto de obras de la empresa dentro de "antigüedad" (si aplica)
  * y opcionalmente filtradas por tipo.
+ *
+ * `tipos` llega ya normalizado (normLower) — el LLM devuelve "Edificación"
+ * y la empresa guarda "edificacion".
  */
 function experienciaAcumulada(empresa, { antiguedadMaxAnios = null, tipos = [] } = {}) {
   const now = new Date();
   const yearNow = now.getFullYear();
   const obras = (empresa.experiencia || []).filter((o) => {
     if (antiguedadMaxAnios && o.anio && yearNow - o.anio > antiguedadMaxAnios) return false;
-    if (tipos.length && o.tipo && !tipos.includes(o.tipo)) return false;
+    if (tipos.length && o.tipo && !tipos.includes(normLower(o.tipo))) return false;
     return true;
   });
   const monto = obras.reduce((acc, o) => acc + (Number(o.monto) || 0), 0);
@@ -189,13 +192,20 @@ export function evaluarProceso(requisitos, empresa, opts = {}) {
   const razones = [];
   const datos = {};
 
-  const reqMonto = requisitos?.experienciaMonto ?? null;
+  // 0 no es requisito, es "no aplica". Sin este guard, reqMonto=0 → `califica`
+  // contra nada. Va acá además de en los extractores porque hay resultados
+  // con 0 ya persistidos en hash-cache y en procesos.requisitos.
+  const reqMontoRaw = Number(requisitos?.experienciaMonto);
+  const reqMonto = Number.isFinite(reqMontoRaw) && reqMontoRaw > 0 ? reqMontoRaw : null;
   const tiposReq = requisitos?.tiposObraSimilar ?? [];
   const antiguedad = requisitos?.antiguedadMaxAnios ?? null;
 
   // 1. verificar especialidades
-  const especialidadesEmpresa = new Set((empresa.especialidades || []).map((s) => s.toLowerCase()));
-  const tiposMatched = tiposReq.filter((t) => especialidadesEmpresa.has(t.toLowerCase()));
+  const especialidadesEmpresa = new Set((empresa.especialidades || []).map(normLower));
+  // normalizado: el filtro de experiencia compara contra estos mismos valores
+  const tiposMatched = [...new Set(tiposReq.map(normLower))].filter((t) =>
+    especialidadesEmpresa.has(t)
+  );
   datos.tiposRequeridos = tiposReq;
   datos.tiposMatched = tiposMatched;
   if (tiposReq.length && !tiposMatched.length) {
@@ -253,7 +263,7 @@ export function evaluarProceso(requisitos, empresa, opts = {}) {
   if (resultado === "consorcio") {
     sugerenciaConsorcio = {
       gapMonto: Math.max(gap || 0, 0),
-      especialidadIdeal: tiposReq.find((t) => !especialidadesEmpresa.has(t.toLowerCase())) || null,
+      especialidadIdeal: tiposReq.find((t) => !especialidadesEmpresa.has(normLower(t))) || null,
       aporteEmpresaPorcentaje: reqMonto ? Math.min(Math.round((expMonto / reqMonto) * 100), 100) : null,
     };
   }

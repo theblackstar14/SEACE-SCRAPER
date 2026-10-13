@@ -4,8 +4,9 @@ import { scrapeSeace } from "./src/scraper/seaceScraper.js";
 import { scrapeDetalle, descargarDoc } from "./src/scraper/seaceDetalle.js";
 import { cache, swr, procesoRegistry, registerProcesos } from "./src/cache.js";
 import { shutdownBrowser, poolStats } from "./src/browserPool.js";
-import { createSupabaseStore, isSupabaseAvailable } from "./src/store/supabaseStore.js";
-import { downloadBases, getSignedUrl } from "./src/store/supabaseStorage.js";
+import { createPgStore, isPgAvailable } from "./src/store/pgStore.js";
+import { readDoc } from "./src/store/docStore.js";
+import { descargarDocHttp } from "./src/scraper/descargaHttp.js";
 
 const app = express();
 app.disable("x-powered-by");
@@ -24,7 +25,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -244,25 +245,36 @@ app.post("/api/v1/cache/purge", (req, res) => {
 });
 
 // ============================================================================
-// API v2: lee de Supabase. Para consumo del ERP.
+// API v2: lee de Postgres (la DB del ERP). Para consumo del ERP.
 // ============================================================================
+
+// Un solo chequeo de configuración en vez de uno por endpoint.
+const db = (req, res, next) => {
+  if (!isPgAvailable()) return res.status(503).json({ error: "DATABASE_URL no configurada" });
+  req.db = createPgStore();
+  next();
+};
+app.use("/api/v2", db);
 
 // GET /api/v2/procesos?resultado=califica&minDias=15&minScore=50&limit=20
 // Lista procesos analizados (último análisis por nid_proceso).
 app.get("/api/v2/procesos", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
   try {
-    const sb = createSupabaseStore();
     const {
       resultado, estado, minScore, minDias,
       minMonto, maxMonto,
       region, provincia, distrito,
       cumplePlantel, search,
+      revisar, pinned, integrada,
       orderBy, direction, limit, offset,
     } = req.query;
-    const result = await sb.queryProcesos({
+    const bool = (v) => (v === undefined ? undefined : v === "true" || v === "1");
+    const result = await req.db.queryProcesos({
       resultado,
       estado,
+      revisar: bool(revisar),
+      pinned: bool(pinned),
+      integrada: bool(integrada),
       minScore: minScore ? Number(minScore) : undefined,
       minDias: minDias ? Number(minDias) : undefined,
       minMonto: minMonto ? Number(minMonto) : undefined,
@@ -283,13 +295,20 @@ app.get("/api/v2/procesos", async (req, res) => {
   }
 });
 
-// GET /api/v2/ubicaciones — devuelve regiones/provincias/distritos distintas para filtros
-app.get("/api/v2/ubicaciones", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+// GET /api/v2/alertas — lo que cambió desde el run anterior.
+// Es la pantalla de inicio del ERP: lo único que alguien mira a las 8am.
+app.get("/api/v2/alertas", async (req, res) => {
   try {
-    const sb = createSupabaseStore();
-    const ub = await sb.getUbicacionesDistintas();
-    res.json(ub);
+    res.json({ data: await req.db.getAlertas({ limit: Math.min(Number(req.query.limit) || 100, 500) }) });
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+// GET /api/v2/ubicaciones — regiones/provincias/distritos distintas para filtros
+app.get("/api/v2/ubicaciones", async (req, res) => {
+  try {
+    res.json(await req.db.getUbicacionesDistintas());
   } catch (e) {
     sendError(res, req, e);
   }
@@ -297,10 +316,8 @@ app.get("/api/v2/ubicaciones", async (req, res) => {
 
 // GET /api/v2/empresa — perfil de la empresa activa (incluye personal)
 app.get("/api/v2/empresa", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
   try {
-    const sb = createSupabaseStore();
-    const empresa = await sb.getEmpresaActiva();
+    const empresa = await req.db.getEmpresaActiva();
     if (!empresa) return res.status(404).json({ error: "empresa no encontrada" });
     res.json(empresa);
   } catch (e) {
@@ -310,11 +327,8 @@ app.get("/api/v2/empresa", async (req, res) => {
 
 // PUT /api/v2/empresa — actualiza empresa activa (CRUD básico)
 app.put("/api/v2/empresa", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
   try {
-    const sb = createSupabaseStore();
-    const updated = await sb.updateEmpresaActiva(req.body);
-    res.json(updated);
+    res.json(await req.db.updateEmpresaActiva(req.body));
   } catch (e) {
     sendError(res, req, e);
   }
@@ -323,51 +337,92 @@ app.put("/api/v2/empresa", async (req, res) => {
 // GET /api/v2/procesos/:nidProceso
 // Detalle completo del último análisis de un proceso, con documentos.
 app.get("/api/v2/procesos/:nidProceso", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
   try {
-    const sb = createSupabaseStore();
-    const proceso = await sb.getProceso(req.params.nidProceso);
+    const proceso = await req.db.getProceso(req.params.nidProceso);
     if (!proceso) return res.status(404).json({ error: "proceso no encontrado" });
-    const documentos = await sb.getDocumentos(req.params.nidProceso);
+    const documentos = await req.db.getDocumentos(req.params.nidProceso);
     res.json({ proceso, documentos });
   } catch (e) {
     sendError(res, req, e);
   }
 });
 
-// GET /api/v2/procesos/:nidProceso/documentos/:docId/download
-// Stream del archivo desde Supabase Storage al cliente.
-app.get("/api/v2/procesos/:nidProceso/documentos/:docId/download", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+// PUT/DELETE /api/v2/procesos/:nidProceso/pin — el ERP protege un proceso de
+// la purga nocturna. Sin pin, sus documentos se borran 7 días después del
+// cierre de presentación.
+app.put("/api/v2/procesos/:nidProceso/pin", async (req, res) => {
   try {
-    const sb = createSupabaseStore();
-    const docs = await sb.getDocumentos(req.params.nidProceso);
-    const doc = docs.find((d) => String(d.id) === req.params.docId);
-    if (!doc) return res.status(404).json({ error: "documento no encontrado" });
-    if (!doc.storage_path) return res.status(404).json({ error: "documento sin storage_path" });
-
-    const buffer = await downloadBases(doc.storage_path);
-    const safeName = sanitizeFilename(doc.filename);
-    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
-    res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader("Cache-Control", "public, max-age=3600");
-    res.send(buffer);
+    res.json(await req.db.pin(req.params.nidProceso, req.body || {}));
   } catch (e) {
     sendError(res, req, e);
   }
 });
 
-// GET /api/v2/procesos/:nidProceso/documentos/:docId/url
-// Devuelve URL firmada (válida 1h) — útil para download directo desde frontend.
-app.get("/api/v2/procesos/:nidProceso/documentos/:docId/url", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
+app.delete("/api/v2/procesos/:nidProceso/pin", async (req, res) => {
   try {
-    const sb = createSupabaseStore();
-    const docs = await sb.getDocumentos(req.params.nidProceso);
-    const doc = docs.find((d) => String(d.id) === req.params.docId);
-    if (!doc?.storage_path) return res.status(404).json({ error: "documento no encontrado" });
-    const url = await getSignedUrl(doc.storage_path, { expiresIn: 3600 });
-    res.json({ url, filename: doc.filename, expiresIn: 3600 });
+    res.json(await req.db.unpin(req.params.nidProceso));
+  } catch (e) {
+    sendError(res, req, e);
+  }
+});
+
+/**
+ * Busca una descarga en la tabla de documentos de la ficha (jsonb en procesos).
+ *
+ * Sirve de whitelist: solo se bajan en vivo uuids que nosotros mismos vimos en
+ * la ficha de ESE proceso. Aceptar un uuid cualquiera del cliente convertiría
+ * esto en un proxy abierto contra Alfresco.
+ */
+async function descargaDeFicha(db, nidProceso, { uuid, filename }) {
+  const p = await db.getProceso(nidProceso);
+  for (const d of p?.documentos || []) {
+    for (const x of d.descargas || []) {
+      if (uuid ? x.uuid === uuid : x.filename === filename) return x;
+    }
+  }
+  return null;
+}
+
+function enviarDoc(res, filename, buffer, inmutable) {
+  res.setHeader("Content-Disposition", `attachment; filename="${sanitizeFilename(filename)}"`);
+  res.setHeader("Content-Type", "application/octet-stream");
+  // inmutable solo si el nombre del archivo ES su hash; lo vivo puede cambiar
+  res.setHeader("Cache-Control", inmutable ? "public, max-age=31536000, immutable" : "private, max-age=300");
+  res.send(buffer);
+}
+
+// GET /api/v2/procesos/:nidProceso/documentos/:ref/download
+//
+// ESTE es el link que se le pasa al ERP: la URL de SEACE no se puede linkear
+// (lleva un alf_ticket de un solo uso que caduca). `ref` es un sha256 si el
+// documento está guardado en disco, o el uuid de Alfresco para cualquier otro
+// de la ficha — los que nunca se bajaron (saltados por maxDocMB, actas,
+// pliegos absolutorios). En ese caso hacemos los dos GETs acá y streameamos.
+app.get("/api/v2/procesos/:nidProceso/documentos/:ref/download", async (req, res) => {
+  const { nidProceso, ref } = req.params;
+  try {
+    if (/^[a-f0-9]{64}$/i.test(ref)) {
+      const docs = await req.db.getDocumentos(nidProceso);
+      const doc = docs.find((d) => d.hash_sha256 === ref);
+      if (!doc) return res.status(404).json({ error: "documento no encontrado" });
+      try {
+        return enviarDoc(res, doc.filename, await readDoc(doc.path), true);
+      } catch {
+        // lo borró la purga. Si la ficha todavía tiene su uuid, se baja en
+        // vivo: un link viejo del ERP sigue funcionando en vez de dar 410.
+        const viva = await descargaDeFicha(req.db, nidProceso, { filename: doc.filename });
+        if (!viva) {
+          return res.status(410).json({ error: "documento purgado del disco", filename: doc.filename });
+        }
+        const out = await descargarDocHttp(viva.uuid, viva.filename);
+        return enviarDoc(res, out.filename, out.buffer, false);
+      }
+    }
+
+    const doc = await descargaDeFicha(req.db, nidProceso, { uuid: ref });
+    if (!doc) return res.status(404).json({ error: "uuid no está en la ficha de este proceso" });
+    const out = await descargarDocHttp(ref, doc.filename);
+    enviarDoc(res, out.filename, out.buffer, false);
   } catch (e) {
     sendError(res, req, e);
   }
@@ -375,11 +430,8 @@ app.get("/api/v2/procesos/:nidProceso/documentos/:docId/url", async (req, res) =
 
 // GET /api/v2/runs — lista runs recientes
 app.get("/api/v2/runs", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
   try {
-    const sb = createSupabaseStore();
-    const runs = await sb.listRuns(Math.min(Number(req.query.limit) || 50, 200));
-    res.json({ data: runs });
+    res.json({ data: await req.db.listRuns(Math.min(Number(req.query.limit) || 50, 200)) });
   } catch (e) {
     sendError(res, req, e);
   }
@@ -387,11 +439,8 @@ app.get("/api/v2/runs", async (req, res) => {
 
 // GET /api/v2/last-run — último run con sus procesos
 app.get("/api/v2/last-run", async (req, res) => {
-  if (!isSupabaseAvailable()) return res.status(503).json({ error: "supabase no configurado" });
   try {
-    const sb = createSupabaseStore();
-    const last = await sb.getLastRun();
-    res.json(last || { run: null, procesos: [] });
+    res.json((await req.db.getLastRun()) || { run: null, procesos: [] });
   } catch (e) {
     sendError(res, req, e);
   }

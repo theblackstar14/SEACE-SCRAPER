@@ -2,7 +2,7 @@ import { withPage } from "../browserPool.js";
 import { navigateToFicha } from "./common.js";
 import { T } from "./selectors.js";
 import { extractCronograma, findFechaPresentacion } from "./cronograma.js";
-import { extractDocumentos, selectBasesIntegradas } from "./documentos.js";
+import { extractDocumentos, selectBasesIntegradas, parseSizeMB } from "./documentos.js";
 import { parseMonto } from "./parser.js";
 import * as cheerio from "cheerio";
 
@@ -333,21 +333,6 @@ export async function scrapeDetalleConDescarga({
 
     return { detalle, descarga, docSelected };
   });
-}
-
-/**
- * Parsea sizeText tipo "(5884 KB)" → MB number, o null si no parsea.
- */
-function parseSizeMB(sizeText) {
-  if (!sizeText) return null;
-  const m = String(sizeText).match(/\(([\d.,]+)\s*([KMG]?B)\)/i);
-  if (!m) return null;
-  const num = parseFloat(m[1].replace(",", "."));
-  const unit = m[2].toUpperCase();
-  if (unit === "KB") return num / 1024;
-  if (unit === "MB") return num;
-  if (unit === "GB") return num * 1024;
-  return num / 1024 / 1024; // bytes
 }
 
 export async function descargarDoc({ nomenclatura, nidProceso, nidConvocatoria, filename, filters }) {

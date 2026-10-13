@@ -5,12 +5,15 @@ export const SEL = {
   tabBuscador: "a[href='#tbBuscador\\:tab1']",
 
   // filtros del form
-  objetoDropdown: "#tbBuscador\\:idFormBuscarProceso\\:j_idt188", // select one menu "Objeto de Contratación"
-  objetoLabel: "#tbBuscador\\:idFormBuscarProceso\\:j_idt188_label",
-  objetoPanel: "#tbBuscador\\:idFormBuscarProceso\\:j_idt188_panel",
+  buscadorForm: "tbBuscador:idFormBuscarProceso", // id crudo, sin escapar
 
-  anioConvocatoria: "#tbBuscador\\:idFormBuscarProceso\\:j_idt198", // año (requerido)
-  versionSeace: "#tbBuscador\\:idFormBuscarProceso\\:j_idt192", // "Seace 3" default
+  // El dropdown "Objeto de Contratación" NO tiene id estable: JSF genera
+  // j_idt### y rota en cada redespliegue (j_idt188 en 2026-04 → j_idt191 en
+  // 2026-10). Se resuelve en runtime por sus opciones — ver
+  // findSelectOneMenuByOptions() en common.js.
+  objetoOpciones: ["Bien", "Servicio", "Obra"],
+
+  anioConvocatoria: "#tbBuscador\\:idFormBuscarProceso\\:anioConvocatoria", // año (requerido)
 
   // búsqueda avanzada (fieldset colapsable)
   avanzadaToggle: "#tbBuscador\\:idFormBuscarProceso\\:fieldsetAvanzada .ui-fieldset-toggler, " +

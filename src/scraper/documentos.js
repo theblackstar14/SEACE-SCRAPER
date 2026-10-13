@@ -104,6 +104,21 @@ export function extractDocumentos($) {
 }
 
 /**
+ * Parsea el sizeText que produce extractDocumentos ("(5884 KB)") → MB, o null.
+ */
+export function parseSizeMB(sizeText) {
+  if (!sizeText) return null;
+  const m = String(sizeText).match(/\(([\d.,]+)\s*([KMG]?B)\)/i);
+  if (!m) return null;
+  const num = parseFloat(m[1].replace(",", "."));
+  const unit = m[2].toUpperCase();
+  if (unit === "KB") return num / 1024;
+  if (unit === "MB") return num;
+  if (unit === "GB") return num * 1024;
+  return num / 1024 / 1024; // bytes
+}
+
+/**
  * Selecciona el mejor documento para análisis: Bases Integradas preferido, Bases fallback.
  *
  * Reglas de prioridad:

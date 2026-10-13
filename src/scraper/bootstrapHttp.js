@@ -18,6 +18,42 @@ import { openBuscador, collectAllPages } from "./common.js";
 import { SEL } from "./selectors.js";
 import { getSession, resetSession } from "./httpClient.js";
 
+const ROWS_SEL = "#tbBuscador\\:idFormBuscarProceso\\:dtProcesos tbody tr[data-ri]";
+
+/**
+ * Click en "siguiente" y espera a que la tabla REALMENTE cambie.
+ *
+ * waitForResponse(POST) resuelve cuando llega el response, no cuando
+ * PrimeFaces aplicó el update al DOM. Leer las filas ahí devuelve las de la
+ * página anterior — y como el segundo click sí avanza, la página intermedia
+ * se pierde entera (medido: pág1 y pág2 idénticas, pág3 con contenido de
+ * pág3).
+ *
+ * `data-ri` es el índice absoluto de fila: pág 1 = 0..14, pág 2 = 15..29.
+ * Que cambie el de la primera fila ES la definición de "paginó".
+ *
+ * @returns {Promise<boolean>} false si no hay botón siguiente o no avanzó.
+ */
+async function gotoNextPage(page, { timeout = 25_000 } = {}) {
+  const next = await page.$(SEL.paginatorNext);
+  if (!next) return false;
+
+  const prevRi = await page.$eval(ROWS_SEL, (tr) => tr.getAttribute("data-ri")).catch(() => null);
+  await next.click();
+
+  try {
+    await page.waitForFunction(
+      ({ sel, prev }) => document.querySelector(sel)?.getAttribute("data-ri") !== prev,
+      { sel: ROWS_SEL, prev: prevRi },
+      { timeout }
+    );
+    return true;
+  } catch {
+    console.warn(`[bootstrap-batch] la tabla no avanzó tras ${timeout}ms (data-ri sigue en ${prevRi})`);
+    return false;
+  }
+}
+
 /**
  * Extrae el button ID de la celda Acciones de cada row.
  * El onclick tiene formato:
@@ -60,7 +96,9 @@ async function captureViewState(page) {
  *   - filters: filtros buscador
  *   - onPageRows: async (rowsOfThisPage, session, pageIdx) => any
  *     callback ejecutado con las rows de cada página. Bloquea la paginación
- *     hasta que termina (await).
+ *     hasta que termina (await). Si devuelve "stop", corta la paginación
+ *     (el caller ya juntó lo que necesitaba; seguir son páginas gratis
+ *     para nadie).
  *   - maxPages: cota
  */
 export async function bootstrapBatchByPage({ filters = {}, onPageRows, maxPages = 50 } = {}) {
@@ -138,21 +176,15 @@ export async function bootstrapBatchByPage({ filters = {}, onPageRows, maxPages 
       // CALLBACK: procesa estas rows ANTES de paginar
       // (los button IDs solo son válidos mientras esta página está visible)
       if (onPageRows) {
-        await onPageRows(rowsData, session, pageIdx);
+        const signal = await onPageRows(rowsData, session, pageIdx);
+        if (signal === "stop") {
+          console.log(`[bootstrap-batch] stop pedido por caller en página ${pageIdx + 1}`);
+          break;
+        }
       }
 
       // siguiente página
-      const next = await page.$(SEL.paginatorNext);
-      if (!next) break;
-
-      const respPromise = page
-        .waitForResponse(
-          (r) => r.url().includes("buscadorPublico") && r.request().method() === "POST",
-          { timeout: 25_000 }
-        )
-        .catch(() => null);
-      await next.click();
-      await respPromise;
+      if (!(await gotoNextPage(page))) break;
 
       // re-capturar ViewState
       const newVs = await captureViewState(page);
@@ -276,17 +308,7 @@ export async function bootstrapBuscador({ filters = {}, maxRows = 1000, maxPages
       }
 
       // siguiente página
-      const next = await page.$(SEL.paginatorNext);
-      if (!next) break;
-
-      const respPromise = page
-        .waitForResponse(
-          (r) => r.url().includes("buscadorPublico") && r.request().method() === "POST",
-          { timeout: 25_000 }
-        )
-        .catch(() => null);
-      await next.click();
-      await respPromise;
+      if (!(await gotoNextPage(page))) break;
 
       // re-capturar ViewState porque puede rotar
       const newVs = await captureViewState(page);

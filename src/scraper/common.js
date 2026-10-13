@@ -62,6 +62,38 @@ async function selectPrimeMenu(page, { dropdownId, labelId, panelId, value }) {
   ).catch(() => {});
 }
 
+/** `tbBuscador:idForm...` → `#tbBuscador\:idForm...` */
+function cssId(id) {
+  return "#" + id.replace(/:/g, "\\:");
+}
+
+/**
+ * Encuentra un selectOneMenu del form buscador por las opciones que contiene,
+ * en vez de por su id.
+ *
+ * Los id `j_idt###` son autogenerados por JSF y rotan cuando SEACE redespliega
+ * (el de Objeto de Contratación pasó de j_idt188 a j_idt191 entre 2026-04 y
+ * 2026-10, rompiendo el scraper entero). Las opciones del dropdown no cambian.
+ *
+ * @returns {Promise<string|null>} id crudo (sin escapar) o null
+ */
+async function findSelectOneMenuByOptions(page, formId, opciones) {
+  return page.evaluate(
+    ({ fid, wanted }) => {
+      const form = document.getElementById(fid);
+      if (!form) return null;
+      for (const el of form.querySelectorAll(".ui-selectonemenu")) {
+        const panel = document.getElementById(el.id + "_panel");
+        if (!panel) continue;
+        const opts = [...panel.querySelectorAll("li")].map((li) => li.textContent.trim());
+        if (wanted.every((w) => opts.includes(w))) return el.id;
+      }
+      return null;
+    },
+    { fid: formId, wanted: opciones }
+  );
+}
+
 /**
  * Expande "Búsqueda Avanzada" si está colapsada.
  */
@@ -184,12 +216,23 @@ export async function openBuscador(page, filters = {}) {
   // esperar form listo
   await page.waitForSelector(SEL.btnBuscar, { state: "visible", timeout: T.selector });
 
-  // filtro: Objeto de Contratación
+  // filtro: Objeto de Contratación (id resuelto en runtime, ver selectors.js)
+  let objetoLabelSel = null;
   if (filters.objetoContratacion) {
+    const objetoId = await findSelectOneMenuByOptions(page, SEL.buscadorForm, SEL.objetoOpciones);
+    if (!objetoId) {
+      throw new Error(
+        `No encontré el dropdown "Objeto de Contratación" (opciones ${SEL.objetoOpciones.join("/")}). ` +
+          `¿Cambió el form de SEACE? Correr scripts/dump-ids.js.`
+      );
+    }
+    const base = cssId(objetoId);
+    objetoLabelSel = `${base}_label`;
+    console.log(`[openBuscador] objeto dropdown resuelto: ${objetoId}`);
     await selectPrimeMenu(page, {
-      dropdownId: SEL.objetoDropdown,
-      labelId: SEL.objetoLabel,
-      panelId: SEL.objetoPanel,
+      dropdownId: base,
+      labelId: objetoLabelSel,
+      panelId: `${base}_panel`,
       value: filters.objetoContratacion,
     });
   }
@@ -211,12 +254,12 @@ export async function openBuscador(page, filters = {}) {
   // log del estado de filtros antes de buscar (debug)
   const filterState = await page.evaluate(
     ({ labelId, fIni, fFin }) => ({
-      objetoLabel: document.querySelector(labelId)?.textContent?.trim() || null,
+      objetoLabel: labelId ? document.querySelector(labelId)?.textContent?.trim() || null : null,
       fechaIni: document.querySelector(fIni)?.value || null,
       fechaFin: document.querySelector(fFin)?.value || null,
     }),
     {
-      labelId: SEL.objetoLabel,
+      labelId: objetoLabelSel,
       fIni: SEL.fechaInicioInput,
       fFin: SEL.fechaFinInput,
     }

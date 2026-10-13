@@ -14,8 +14,8 @@ import { createHash } from "node:crypto";
 import { runObraPipeline } from "../pipeline/orchestrator.js";
 import { runObraPipelineHttp } from "../pipeline/orchestratorHttp.js";
 import { createJsonStore } from "../store/jsonStore.js";
-import { createSupabaseStore, isSupabaseAvailable } from "../store/supabaseStore.js";
-import { uploadBases } from "../store/supabaseStorage.js";
+import { createPgStore, isPgAvailable, closePool } from "../store/pgStore.js";
+import { sizeOnDisk } from "../store/docStore.js";
 import { formatSeaceDate } from "../scraper/common.js";
 import { shutdownBrowser } from "../browserPool.js";
 
@@ -43,8 +43,8 @@ function parseArgs(argv) {
     else if (a === "--max-pub-dias") args.maxPubDias = Number(next), i++;
     else if (a === "--max-doc-mb") args.maxDocMB = Number(next), i++;
     else if (a === "--http") args.useHttp = true;
-    else if (a === "--supabase") args.useSupabase = true;
-    else if (a === "--no-supabase") args.noSupabase = true;
+    else if (a === "--no-db") args.noDb = true;
+    else if (a === "--no-purge") args.noPurge = true;
     else if (a === "--help" || a === "-h") {
       console.log(
         `Usage: node src/cli/run-obra.js [opts]\n` +
@@ -67,8 +67,8 @@ function parseArgs(argv) {
           `  --max-pub-dias N   descarta si pubFecha > N días (default 30)\n` +
           `  --max-doc-mb N     skip download si Bases > N MB (default 50)\n` +
           `  --http             usa pipeline HTTP directo (10x mas rapido, experimental)\n` +
-          `  --supabase         persiste run + procesos + PDFs en Supabase (auto si SUPABASE_URL en env)\n` +
-          `  --no-supabase      desactiva persist a Supabase (solo JSON local)\n`
+          `  --no-db            no persiste en Postgres (solo JSON local)\n` +
+          `  --no-purge         no borra documentos vencidos al terminar\n`
       );
       process.exit(0);
     }
@@ -121,8 +121,8 @@ async function main() {
   console.log(`   Rango:    ${fechaDesde} -> ${fechaHasta}`);
   console.log(`   Limite:   ${args.limit} procesos`);
   console.log(`   Pipeline: ${args.useHttp ? "HTTP DIRECTO (rapido)" : "Playwright (clasico)"}`);
-  const sbActive = (args.useSupabase ?? (isSupabaseAvailable() && !args.noSupabase)) && isSupabaseAvailable();
-  console.log(`   Supabase: ${sbActive ? "ON (DB + Storage)" : isSupabaseAvailable() ? "off (--no-supabase)" : "off (sin SUPABASE_URL)"}`);
+  const usePg = isPgAvailable() && !args.noDb;
+  console.log(`   Postgres: ${usePg ? "ON (DB + docs en disco)" : isPgAvailable() ? "off (--no-db)" : "off (sin DATABASE_URL)"}`);
   console.log(`   SkipPDF:  ${!!args.skipPdf}`);
   console.log(`   LLM:      ${providerLabel} (${llmPolicy})`);
   console.log(`   Filtros:  >=${minDias}d antes presentacion | VR <= ${maxMontoRatio}x capacidad | pubFecha <= ${maxPubDias}d | doc <= ${maxDocMB}MB\n`);
@@ -138,10 +138,10 @@ async function main() {
         objetoContratacion: "Obra",
         fechaDesde,
         fechaHasta,
-        allPages: true,
       },
       limit: args.limit,
-      concurrency: args.concurrency || 2,
+      // el pipeline HTTP aguanta más: son POSTs, no browsers
+      concurrency: args.concurrency || (args.useHttp ? 5 : 2),
       skipPdf: !!args.skipPdf,
       useLlm,
       llmPolicy,
@@ -160,51 +160,58 @@ async function main() {
     const file = await store.saveRun(runId, payloadForJson);
     console.log(`\nGuardado en: ${file}`);
 
-    // PERSIST a Supabase si configurado
-    const useSupabase =
-      args.useSupabase ?? (isSupabaseAvailable() && !args.noSupabase);
-    if (useSupabase && isSupabaseAvailable()) {
+    // PERSIST a Postgres si configurado
+    if (usePg) {
       try {
-        const sb = createSupabaseStore();
-        console.log(`\n[supabase] persistiendo run + procesos...`);
+        const db = createPgStore();
+        console.log(`\n[pg] persistiendo run + procesos...`);
+        await db.saveRun(runId, payloadForJson);
 
-        // 1. saveRun + procesos
-        await sb.saveRun(runId, payloadForJson);
-
-        // 2. subir PDFs descargados a Storage
-        let uploaded = 0;
+        // documentos: a disco por hash, fila en la DB. El mismo ZIP en dos
+        // procesos se escribe una vez y queda ligado a los dos.
+        let guardados = 0;
         for (const [nidProceso, info] of buffers.entries()) {
           try {
-            const { path: storagePath } = await uploadBases({
-              nidProceso,
-              filename: info.filename,
-              buffer: info.buffer,
-            });
             const hash = createHash("sha256").update(info.buffer).digest("hex");
-            await sb.saveDocumento({
+            await db.saveDocumento({
               nidProceso,
+              buffer: info.buffer,
+              hashSha256: hash,
               filename: info.filename,
               tipo: info.tipo,
               sizeBytes: info.size,
-              storagePath,
-              hashSha256: hash,
             });
-            uploaded++;
+            guardados++;
           } catch (e) {
-            console.warn(`[supabase] upload fail ${nidProceso}: ${e.message}`);
+            console.warn(`[pg] doc fail ${nidProceso}: ${e.message}`);
           }
         }
-        console.log(
-          `[supabase] OK: 1 run, ${payloadForJson.procesos?.length || 0} procesos, ${uploaded} PDFs`
-        );
+        console.log(`[pg] OK: 1 run, ${payloadForJson.procesos?.length || 0} procesos, ${guardados} docs`);
+
+        // RETENCIÓN: lo que venció hace >7d y nadie pineó se va. Acá y no en
+        // un cron aparte: el run nocturno ya es el momento en que el estado
+        // de todos los procesos está fresco.
+        if (!args.noPurge) {
+          const { borrados, bytes } = await db.purgarDocumentos();
+          const disco = await sizeOnDisk();
+          console.log(
+            `[pg] retención: ${borrados} docs borrados (${(bytes / 1e6).toFixed(1)}MB) — ` +
+              `quedan ${disco.archivos} archivos, ${(disco.bytes / 1e6).toFixed(1)}MB`
+          );
+        }
       } catch (e) {
-        console.error(`[supabase] FAIL: ${e.message}`);
+        console.error(`[pg] FAIL: ${e.message}`);
+      } finally {
+        await closePool().catch(() => {});
       }
     }
     console.log(`\nResumen:`);
     console.log(`   Listados:           ${payload.resumen.totalListados}`);
-    console.log(`   Pre-filtro pasaron: ${payload.resumen.preFiltroPasaron}/${payload.resumen.limit} (descartados: ${payload.resumen.descartadosPrefiltro})`);
-    console.log(`   Cronogramas leidos: ${payload.resumen.cronogramasLeidos}`);
+    // el pipeline HTTP no reporta pre-filtro por separado (filtra por página)
+    if (payload.resumen.preFiltroPasaron !== undefined) {
+      console.log(`   Pre-filtro pasaron: ${payload.resumen.preFiltroPasaron}/${payload.resumen.limit} (descartados: ${payload.resumen.descartadosPrefiltro})`);
+    }
+    console.log(`   Fichas leidas:      ${payload.resumen.detallesLeidos ?? payload.resumen.cronogramasLeidos}`);
     console.log(`   Tiempo suficiente:  ${payload.resumen.conTiempoSuficiente}`);
     console.log(`   Detalle completo:   ${payload.resumen.detalleCompleto}`);
     console.log(`   --------------------`);
@@ -231,6 +238,31 @@ async function main() {
       console.log(`   Dedup runtime:      ${payload.resumen.dedupRuntimeHits} (reuso descarga)`);
     }
     console.log(`   Duracion:           ${(payload.resumen.duracionMs / 1000).toFixed(1)}s`);
+
+    // Lo nuevo desde el run anterior. En un cron nocturno esto es LO UNICO
+    // que alguien lee; el resto del reporte es para cuando ya hay interes.
+    if (payload.alertas?.length) {
+      // Separadas a proposito: una oportunidad y un "no pude leerlo" no se
+      // atienden igual, y mezclarlas hace que la lista se lea como ruido.
+      const porTipo = [
+        ["OPORTUNIDADES", "oportunidad"],
+        ["REVISAR A MANO (sin evaluacion automatica)", "manual"],
+      ];
+      for (const [titulo, tipo] of porTipo) {
+        const as = payload.alertas.filter((a) => a.revisarTipo === tipo);
+        if (!as.length) continue;
+        console.log(`\n${titulo} (${as.length}):`);
+        as.forEach((a) => {
+          console.log(`   * ${a.nomenclatura} (${a.diasRestantes ?? "?"}d) - ${a.motivo}`);
+          console.log(`     ${(a.entidad || "").slice(0, 60)}`);
+        });
+      }
+    } else if (payload.resumen.aRevisar === 0) {
+      console.log(`\nSin novedades desde el run anterior.`);
+    }
+    if (payload.resumen.sinCambios) {
+      console.log(`   Sin cambios:        ${payload.resumen.sinCambios} (misma huella de doc, no se bajo)`);
+    }
 
     // Top 5 procesos por score
     const top = payload.procesos.slice(0, 5);

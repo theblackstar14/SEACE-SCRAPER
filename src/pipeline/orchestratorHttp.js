@@ -1,8 +1,7 @@
 /**
- * Pipeline HTTP-first. Usa Playwright SOLO para:
- *   - Bootstrap (1× navegación + paginación listado)
- *   - Descargas de PDF (download events)
- * El resto (cronograma, detalle, parseo) por HTTP directo.
+ * Pipeline HTTP-first. Usa Playwright SOLO para el bootstrap
+ * (1× navegación + paginación del listado, para capturar cookies + ViewState).
+ * Detalle, cronograma, parseo y descargas van por HTTP directo.
  *
  * Speedup esperado vs Playwright-only:
  *   - 300 procesos: 2h 16min -> ~10 min
@@ -12,10 +11,10 @@ import pLimit from "p-limit";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { bootstrapBatchByPage } from "../scraper/bootstrapHttp.js";
-import { fetchCronogramaHttp, fetchDetalleHttp } from "../scraper/fichaHttp.js";
-import { scrapeDetalleConDescarga } from "../scraper/seaceDetalle.js";
+import { fetchDetalleHttp } from "../scraper/fichaHttp.js";
+import { descargarDocHttp } from "../scraper/descargaHttp.js";
 import { parseSeaceDate } from "../scraper/cronograma.js";
-import { selectBasesIntegradas } from "../scraper/documentos.js";
+import { selectBasesIntegradas, parseSizeMB } from "../scraper/documentos.js";
 import { extractTextFromDoc } from "../pdf/docExtractor.js";
 import { analizarRequisitos } from "../analyzer/requisitos.js";
 import { evaluarProceso } from "../analyzer/evaluator.js";
@@ -29,6 +28,15 @@ import {
   extractRequisitosWithGeminiText,
 } from "../analyzer/llmExtractor.js";
 import { hashBuffer, getByHash, setByHash, stats as hashCacheStats } from "../analyzer/hashCache.js";
+import {
+  fingerprintDoc,
+  esIntegrada,
+  diasHastaIntegracion,
+  reconciliar,
+  getEstado,
+  saveEstados,
+  purgarVencidos,
+} from "../store/procesoState.js";
 
 const MS_DAY = 86_400_000;
 
@@ -173,8 +181,13 @@ export async function runObraPipelineHttp({
 
   emit("start", { msg: "HTTP pipeline" });
 
-  // 1+2+3. BOOTSTRAP BATCH-POR-PAGINA: pagina + HTTP fetch cronograma de cada pag ANTES de seguir
-  const cronogramaByNid = new Map(); // nidProceso -> { cronograma, fechaPresentacion }
+  // 1+2+3. BOOTSTRAP BATCH-POR-PAGINA: pagina + HTTP fetch de cada pag ANTES de seguir.
+  //
+  // Un solo POST por proceso: fetchCronogramaHttp y fetchDetalleHttp hacían
+  // EL MISMO postFichaForm y solo diferían en el parseo. Traemos el detalle
+  // completo acá, donde el buttonId todavía es válido (deja de serlo apenas
+  // paginamos), y el cronograma sale del mismo HTML.
+  const detalleByNid = new Map(); // nidProceso -> detalle completo
   const allListado = [];
   let processedCount = 0;
 
@@ -196,116 +209,129 @@ export async function runObraPipelineHttp({
 
       allListado.push(...validas);
 
-      // si excedimos limit, no procesamos más HTTP
-      if (processedCount >= limit) return;
-
       const slice = validas.slice(0, Math.max(0, limit - processedCount));
       processedCount += slice.length;
 
-      // HTTP fetch cronograma en paralelo (conc 5)
+      // HTTP fetch detalle completo en paralelo
       const lim = pLimit(concurrency);
       await Promise.all(
         slice.map((r) =>
           lim(async () => {
             try {
-              const result = await fetchCronogramaHttp({
+              const detalle = await fetchDetalleHttp({
                 nomenclatura: r.nomenclatura,
                 nidProceso: r.nidProceso,
                 nidConvocatoria: r.nidConvocatoria,
                 buttonId: r.buttonId,
               });
-              if (!result._error) {
-                cronogramaByNid.set(r.nidProceso, result);
+              if (!detalle._error) {
+                detalleByNid.set(r.nidProceso, detalle);
               }
             } catch (e) {
-              console.warn(`[cronograma-http FAIL] ${r.nomenclatura}: ${e.message}`);
+              console.warn(`[detalle-http FAIL] ${r.nomenclatura}: ${e.message}`);
             }
           })
         )
       );
-      emit("page_done", { msg: `página ${pageIdx + 1}: ${slice.length} cronogramas HTTP procesados` });
+      emit("page_done", { msg: `página ${pageIdx + 1}: ${slice.length} detalles HTTP procesados` });
+
+      // ya juntamos lo pedido — paginar más no aporta nada
+      if (processedCount >= limit) return "stop";
     },
   });
 
-  emit("listado_done", { msg: `${allListado.length} pasaron pre-filtro, ${cronogramaByNid.size} cronogramas OK` });
+  emit("listado_done", { msg: `${allListado.length} pasaron pre-filtro, ${detalleByNid.size} detalles OK` });
 
-  // 4. FILTRO TIEMPO SUFICIENTE
-  const conTiempo = allListado.filter((r) => {
-    const c = cronogramaByNid.get(r.nidProceso);
-    if (!c) return false;
-    return tieneTiempoSuficiente({ fechaPresentacion: c.fechaPresentacion }, { minDias });
-  });
-  emit("filtro_tiempo", { msg: `${conTiempo.length} con >= ${minDias}d para presentación` });
-
-  // 5. DETALLE COMPLETO HTTP + DESCARGA via Playwright (solo descarga PDF necesita browser)
+  // 4. FILTRO TIEMPO SUFICIENTE (+ selección de doc y estado previo).
+  //
+  // La selección del documento se hace ACÁ y no en la descarga porque su
+  // huella es lo que decide si hay que bajar algo: comparada contra el run
+  // anterior dice "el doc es el mismo" sin gastar un byte.
   const detallados = [];
-  const lim = pLimit(concurrency);
+  for (const r of allListado) {
+    const detalle = detalleByNid.get(r.nidProceso);
+    if (!detalle) continue;
+    if (!tieneTiempoSuficiente(detalle, { minDias })) continue;
+    const docSelected = selectBasesIntegradas(detalle.documentos);
+    detallados.push({
+      listado: r,
+      detalle,
+      descarga: null,
+      docSelected,
+      docFingerprint: fingerprintDoc(docSelected),
+      prevEstado: await getEstado(r.nidProceso),
+    });
+  }
+  emit("filtro_tiempo", { msg: `${detallados.length} con >= ${minDias}d para presentación` });
 
-  // 5a. Detalle HTTP en paralelo (rápido — ~2s c/u)
-  await Promise.all(
-    conTiempo.map((r) =>
-      lim(async () => {
-        try {
-          const detalle = await fetchDetalleHttp({
-            nomenclatura: r.nomenclatura,
-            nidProceso: r.nidProceso,
-            nidConvocatoria: r.nidConvocatoria,
-            buttonId: r.buttonId,
-          });
-          if (!detalle._error) {
-            detallados.push({ listado: r, detalle, descarga: null, docSelected: null });
-          } else {
-            detallados.push({ listado: r, detalle: null, descarga: null, error: detalle._error });
-          }
-        } catch (e) {
-          detallados.push({ listado: r, detalle: null, descarga: null, error: e.message });
-        }
-      })
-    )
-  );
-
-  emit("detalle_http_done", { msg: `${detallados.filter((d) => d.detalle).length} detalles HTTP OK` });
-
-  // 5b. DESCARGAS via Playwright (download events son complejos en HTTP, mantenemos browser)
+  // 5b. DESCARGAS directas a Alfresco (sin Playwright).
+  //
+  // El uuid del onclick `descargaDocGeneral(uuid,...)` ya viene en el HTML de
+  // ficha que bajamos en el paso 1-3. Resolverlo es un GET a alfprod.seace,
+  // otro host sin ViewState ni cookies — así que no hay que re-navegar la
+  // ficha. Antes cada descarga costaba un navigateToFicha completo
+  // (openBuscador + findRow paginando hasta 35 páginas) = 33-60s por proceso
+  // solo para volver a una página que ya habíamos leído.
   if (!skipPdf) {
     const seenDocs = new Map();
-    const detalleConDescarga = pLimit(2); // browser sequential
-    const conDetalle = detallados.filter((d) => d.detalle);
+    // ponytail: 2 fijo, no `concurrency`. Medido con 5 en paralelo: un PDF de
+    // 2.2MB que solo tarda 2s pasó a 112s, y un ZIP de 44MB murió con
+    // "terminated". Alfresco estrangula o corta. Subir esto si alguna vez
+    // deja de ser el caso — con 2 no se observó ninguna degradación.
+    const lim = pLimit(2);
+    let dlCounter = 0;
 
     await Promise.all(
-      conDetalle.map((item) =>
-        detalleConDescarga(async () => {
-          try {
-            const sel = selectBasesIntegradas(item.detalle.documentos);
-            if (!sel.doc?.descargas?.length) {
-              item.docSelected = sel;
+      detallados.map((item) =>
+        lim(async () => {
+          const nom = item.listado.nomenclatura;
+          const sel = item.docSelected;
+          const target = sel.doc?.descargas?.[0];
+          if (!target) return;
+
+          // ¿Cambió el documento desde el run anterior? La huella sale de la
+          // ficha (que ya tenemos), así que esto se decide sin bajar nada.
+          // Mismo doc + análisis todavía en el cache por hash = no hay nada
+          // que hacer. En un cron nocturno esto es la mayoría de los procesos.
+          const prev = item.prevEstado;
+          if (prev?.docHash && prev.docFingerprint === item.docFingerprint) {
+            if (await getByHash(prev.docHash)) {
+              console.log(`[sin cambios] ${nom}: misma huella de doc, reuso análisis`);
+              item.reusoHash = prev.docHash;
               return;
             }
-            // usar Playwright SOLO para descarga (download event)
-            const { descarga, docSelected } = await scrapeDetalleConDescarga({
-              nomenclatura: item.listado.nomenclatura,
-              nidProceso: item.listado.nidProceso,
-              nidConvocatoria: item.listado.nidConvocatoria,
-              filters: {
-                objetoContratacion: filters.objetoContratacion || "Obra",
-                fechaDesde: filters.fechaDesde,
-                fechaHasta: filters.fechaHasta,
-                maxDocMB,
-              },
-              downloadBases: true,
-              seenDocs,
-            });
-            item.descarga = descarga;
-            item.docSelected = docSelected;
+          }
+
+          const dedupKey = `${target.filename}|${sel.doc.sizeText || ""}`;
+          if (seenDocs.has(dedupKey)) {
+            console.log(`[dedup HIT] ${nom}: ${target.filename}`);
+            item.descarga = { ...seenDocs.get(dedupKey), _deduped: true };
+            return;
+          }
+
+          const sizeMB = parseSizeMB(sel.doc.sizeText);
+          if (sizeMB && sizeMB > maxDocMB) {
+            console.warn(`[descarga SKIP] ${nom}: ${target.filename} ${sizeMB.toFixed(1)}MB > ${maxDocMB}MB`);
+            sel.skipped = true;
+            sel.skipReason = `archivo ${sizeMB.toFixed(1)}MB > ${maxDocMB}MB`;
+            return;
+          }
+
+          try {
+            const t0 = Date.now();
+            const d = await descargarDocHttp(target.hash, target.filename, { counter: ++dlCounter });
+            console.log(`[descarga] ${nom}: ${d.filename} ${Math.round(d.size / 1024)}KB en ${Date.now() - t0}ms`);
+            item.descarga = d;
+            seenDocs.set(dedupKey, d);
           } catch (e) {
-            console.warn(`[descarga FAIL] ${item.listado.nomenclatura}: ${e.message}`);
+            console.warn(`[descarga FAIL] ${nom}: ${e.message}`);
           }
         })
       )
     );
 
     emit("descarga_done", {
-      msg: `${detallados.filter((d) => d.descarga).length} descargas OK (Playwright)`,
+      msg: `${detallados.filter((d) => d.descarga).length} descargas OK (HTTP directo)`,
     });
   }
 
@@ -322,11 +348,19 @@ export async function runObraPipelineHttp({
       calidadTexto: null,
     };
 
-    if (skipPdf || !descarga || !docSelected?.doc) {
-      analisis.evaluacion = {
-        resultado: "indeterminado",
-        razones: [skipPdf ? "skipPdf=true" : "Sin Bases descargables"],
-      };
+    if (skipPdf || (!descarga && !item.reusoHash) || !docSelected?.doc) {
+      // "Sin Bases descargables" solo si DE VERDAD no hay. Si lo saltamos
+      // nosotros (maxDocMB) o falló la descarga, decirlo: el doc existe y
+      // alguien puede bajarlo a mano. Reportar lo contrario hace que el
+      // gerente descarte un proceso que sí es viable.
+      const razon = skipPdf
+        ? "skipPdf=true"
+        : docSelected?.skipReason
+          ? `Bases NO analizadas: ${docSelected.skipReason} — descargar manualmente`
+          : docSelected?.doc
+            ? "Bases publicadas pero la descarga falló — reintentar"
+            : "Sin Bases descargables";
+      analisis.evaluacion = { resultado: "indeterminado", razones: [razon] };
       enriquecidos.push({ listado: p, detalle, analisis });
       continue;
     }
@@ -334,14 +368,15 @@ export async function runObraPipelineHttp({
     analisis.documentoUsado = {
       etapa: docSelected.doc.etapa,
       documento: docSelected.doc.documento,
-      filename: descarga.filename,
-      tipo: descarga.tipo,
-      size: descarga.size,
+      filename: descarga?.filename || docSelected.doc.descargas?.[0]?.filename || null,
+      tipo: descarga?.tipo || null,
+      size: descarga?.size ?? null,
       confianza: docSelected.confianza,
     };
 
-    // cache hash
-    const docHash = hashBuffer(descarga.buffer);
+    // cache hash. Sin descarga (doc sin cambios) usamos el hash del run
+    // anterior: el bloque de cache de abajo hace el resto.
+    const docHash = descarga ? hashBuffer(descarga.buffer) : item.reusoHash;
     analisis.docHash = docHash;
     const cached = await getByHash(docHash);
     if (cached) {
@@ -367,6 +402,17 @@ export async function runObraPipelineHttp({
       } else {
         analisis.evaluacion = cached.evaluacion || { resultado: "indeterminado", razones: ["cache: sin requisitos"] };
       }
+      enriquecidos.push({ listado: p, detalle, analisis });
+      continue;
+    }
+
+    // Salto reusoHash sin entrada en cache: el TTL venció entre el paso 5b y
+    // acá. No hay buffer que analizar. Raro, pero no vale un crash.
+    if (!descarga) {
+      analisis.evaluacion = {
+        resultado: "indeterminado",
+        razones: ["reuso de análisis previo pero el cache expiró — se reanaliza en el próximo run"],
+      };
       enriquecidos.push({ listado: p, detalle, analisis });
       continue;
     }
@@ -506,7 +552,25 @@ export async function runObraPipelineHttp({
         diasRestantes: detalle?.fechaPresentacion?.diasRestantes ?? null,
         estado: detalle?.fechaPresentacion?.estado,
         cronograma: detalle?.cronograma,
+        // Tabla de documentos de la ficha. Solo bajamos uno (las Bases), pero
+        // el uuid de Alfresco de los demás vale guardarlo: con eso el ERP los
+        // puede pedir en vivo sin que nadie vuelva a scrapear la ficha.
+        documentos: (detalle?.documentos || []).map((d) => ({
+          nro: d.nro,
+          etapa: d.etapa,
+          documento: d.documento,
+          fecha: d.fecha,
+          sizeText: d.sizeText,
+          // `hash` del parser es el uuid de Alfresco, no un sha256. Se renombra
+          // acá para que no se confunda con el hash de contenido del disco.
+          descargas: (d.descargas || []).map((x) => ({
+            uuid: x.hash,
+            filename: x.filename,
+            tipo: x.tipo,
+          })),
+        })),
         documentoUsado: analisis.documentoUsado,
+        docHash: analisis.docHash || null,
         calidadTexto: analisis.calidadTexto,
         llmUsed: analisis.llmUsed || null,
         requisitos: analisis.requisitos
@@ -530,11 +594,72 @@ export async function runObraPipelineHttp({
     })
     .sort((a, b) => (b.score || 0) - (a.score || 0));
 
+  // 8. ESTADO POR PROCESO: ¿qué cambió desde ayer?
+  //
+  // Sin esto el run nocturno produce la misma lista todas las noches y nadie
+  // la mira. Lo único que de verdad pide atención es la aparición de las
+  // Bases Integradas (los montos reales), y eso solo se ve comparando contra
+  // el run anterior.
+  const itemByNid = new Map(detallados.map((i) => [i.listado.nidProceso, i]));
+  const nowIso = new Date().toISOString();
+  const estados = procesos.map((p) => {
+    const item = itemByNid.get(p.id);
+    const est = reconciliar(
+      item?.prevEstado || null,
+      {
+        nidProceso: p.id,
+        nomenclatura: p.nomenclatura,
+        entidad: p.entidad,
+        valorReferencial: p.valorReferencial,
+        fechaPropuesta: p.fechaPropuesta,
+        diasRestantes: p.diasRestantes,
+        resultado: p.evaluacion.resultado,
+        score: p.score,
+        docFingerprint: item?.docFingerprint || null,
+        integrada: esIntegrada(item?.docSelected),
+        docEtapa: item?.docSelected?.doc?.etapa || null,
+        docHash: p.docHash,
+        diasHastaIntegracion: diasHastaIntegracion(p.cronograma),
+      },
+      { minDias, nowIso }
+    );
+    p.novedad = est.novedad;
+    p.revisar = est.revisar;
+    p.revisarTipo = est.revisarTipo;
+    p.motivo = est.motivo;
+    return est;
+  });
+  await saveEstados(estados);
+  const purgados = await purgarVencidos();
+
+  // lo que hay que mirar primero va primero; dentro de eso las oportunidades
+  // antes que lo que solo pide lectura humana, y recién después por score.
+  const prio = (p) => (p.revisar ? (p.revisarTipo === "oportunidad" ? 2 : 1) : 0);
+  procesos.sort((a, b) => prio(b) - prio(a) || (b.score || 0) - (a.score || 0));
+
+  const alertas = procesos
+    .filter((p) => p.revisar)
+    .map((p) => ({
+      nomenclatura: p.nomenclatura,
+      entidad: p.entidad,
+      novedad: p.novedad,
+      revisarTipo: p.revisarTipo,
+      motivo: p.motivo,
+      diasRestantes: p.diasRestantes,
+      score: p.score,
+    }));
+  emit("estado_done", {
+    msg:
+      `${alertas.filter((a) => a.revisarTipo === "oportunidad").length} oportunidades, ` +
+      `${alertas.filter((a) => a.revisarTipo === "manual").length} a revisar a mano, ` +
+      `${estados.filter((e) => e.novedad === "nuevo").length} nuevos, ${purgados} vencidos purgados`,
+  });
+
   const resumen = {
     totalListados: allListado.length,
     limit,
-    cronogramasLeidos: cronogramaByNid.size,
-    conTiempoSuficiente: conTiempo.length,
+    detallesLeidos: detalleByNid.size,
+    conTiempoSuficiente: detallados.length,
     detalleCompleto: detallados.filter((d) => d.detalle).length,
     califican: procesos.filter((p) => p.evaluacion.resultado === "califica").length,
     consorcio: procesos.filter((p) => p.evaluacion.resultado === "consorcio").length,
@@ -545,6 +670,9 @@ export async function runObraPipelineHttp({
     llmUsed: procesos.filter((p) => p.llmUsed).length,
     llmEnabled: useLlm,
     cacheHashHits: enriquecidos.filter((e) => e.analisis.cacheHit).length,
+    nuevos: estados.filter((e) => e.novedad === "nuevo").length,
+    aRevisar: alertas.length,
+    sinCambios: detallados.filter((d) => d.reusoHash).length,
     cacheStats: cstats,
     parametros: { minDias, maxMontoRatio, maxPubDias, maxDocMB },
     duracionMs: Date.now() - runStart,
@@ -572,6 +700,7 @@ export async function runObraPipelineHttp({
     filters,
     empresa: { razonSocial: empresa.razonSocial, ruc: empresa.ruc },
     resumen,
+    alertas,
     procesos,
     _buffers: buffers,
   };

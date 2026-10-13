@@ -423,8 +423,10 @@ export async function runObraPipeline({
     objetoContratacion: filters.objetoContratacion || "Obra",
     fechaDesde: filters.fechaDesde,
     fechaHasta: filters.fechaHasta,
-    allPages: filters.allPages ?? true,
-    limit: filters.allPages === false ? limit : Infinity,
+    // Pedimos exactamente `limit`. Antes pasaba Infinity y paginaba hasta 50
+    // páginas para que el .slice(0, limit) de abajo tirara casi todo.
+    allPages: false,
+    limit,
     maxPages: 50,
   });
   emit("listado_ok", { msg: `${listado.length} procesos en listado` });
@@ -599,6 +601,28 @@ export async function runObraPipeline({
       continue;
     }
 
+    // Guardar en cache hash. Es una función porque el loop tiene varios
+    // `continue` (OCR exitoso, sin texto) que antes saltaban el save del final
+    // — justo el OCR, que es la llamada más cara del pipeline.
+    // No cachea si el LLM falló: sería congelar un error transitorio 30 días.
+    const guardarCache = async () => {
+      if (!analisis.docHash || analisis.cacheHit || analisis.llmFallo) return;
+      if (!analisis.requisitos && !analisis.calidadTexto) return;
+      await setByHash(
+        analisis.docHash,
+        {
+          requisitos: analisis.requisitos,
+          calidadTexto: analisis.calidadTexto,
+          zipContents: analisis.zipContents,
+          evaluacion: analisis.evaluacion,
+        },
+        {
+          filename: analisis.documentoUsado?.filename,
+          size: analisis.documentoUsado?.size,
+        }
+      ).catch(() => {});
+    };
+
     try {
       const doc = await extractTextFromDoc(descarga);
       if (doc.errors.length) {
@@ -677,10 +701,14 @@ export async function runObraPipeline({
               `Extracción por ${providerUsed} (PDF escaneado, OCR): confianza ${llm.confianza.toFixed(2)}`
             );
           }
+          await guardarCache();
           enriquecidos.push({ listado: p, detalle, analisis });
           continue;
         }
-        // ambos LLM fallaron — cae a la rama "No se pudo extraer texto" de abajo
+        // ambos LLM fallaron — cae a la rama "No se pudo extraer texto" de abajo.
+        // Marcado para no cachear: el doc puede ser perfectamente analizable,
+        // falló la llamada.
+        analisis.llmFallo = true;
       }
 
       if (!analisis.textoExtraido || analisis.calidadTexto.escaneado) {
@@ -694,6 +722,7 @@ export async function runObraPipeline({
           razon = `No se pudo extraer texto del ${doc.source.toUpperCase()} (${descarga.filename})`;
         }
         analisis.evaluacion = { resultado: "indeterminado", razones: [razon] };
+        await guardarCache();
         enriquecidos.push({ listado: p, detalle, analisis });
         continue;
       }
@@ -895,18 +924,7 @@ export async function runObraPipeline({
       };
     }
 
-    // guardar en cache hash si tuvimos análisis (cualquiera, incluso indeterminado)
-    if (analisis.docHash && !analisis.cacheHit && (analisis.requisitos || analisis.calidadTexto)) {
-      await setByHash(analisis.docHash, {
-        requisitos: analisis.requisitos,
-        calidadTexto: analisis.calidadTexto,
-        zipContents: analisis.zipContents,
-        evaluacion: analisis.evaluacion,
-      }, {
-        filename: analisis.documentoUsado?.filename,
-        size: analisis.documentoUsado?.size,
-      }).catch(() => {});
-    }
+    await guardarCache();
 
     enriquecidos.push({ listado: p, detalle, analisis });
   }

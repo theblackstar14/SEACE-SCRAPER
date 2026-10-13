@@ -39,7 +39,7 @@ export const REQUISITOS_SCHEMA = {
   properties: {
     experiencia_monto_pen: {
       type: SchemaType.NUMBER,
-      description: "Monto mínimo en soles de experiencia del postor en obras similares. 0 si no aplica.",
+      description: "Monto mínimo en soles de experiencia del postor en obras similares. null si las Bases no lo especifican (NUNCA 0).",
       nullable: true,
     },
     experiencia_veces_vr: {
