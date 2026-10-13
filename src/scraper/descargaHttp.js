@@ -13,6 +13,12 @@
  * ir en paralelo sin el lock de httpClient.js.
  */
 
+import { proxyAgent } from "./proxy.js";
+
+// arma el dispatcher global si hay PROXY_SERVER. Sin esto el fetch de abajo
+// sale por la IP del contenedor y Alfresco responde 403 fuera de Perú.
+proxyAgent();
+
 // ponytail: fetch global (Node 18+) en vez de undici — sigue redirects solo.
 const ECM = "https://alfprod.seace.gob.pe/alfresco";
 const ECM_OP = "https://prodcont2.seace.gob.pe/alfresco";

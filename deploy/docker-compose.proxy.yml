@@ -1,0 +1,21 @@
+# Proxy de salida peruano, en el NAS. Container Manager → Proyecto → Crear,
+# ruta /docker/tinyproxy, origen "Cargar docker-compose.yml".
+#
+# 100.99.203.34 = IP Tailscale del NAS (nas-mmhigh). Publicar en esa IP y no
+# en todas es lo que evita que el proxy quede abierto a internet si el router
+# tiene port forwarding.
+
+services:
+  tinyproxy:
+    image: vimagick/tinyproxy
+    container_name: tinyproxy
+    restart: always
+    # host y no `ports:` por dos razones. Una, Docker no siempre puede bindear
+    # la IP de tailscale0. Dos, con userland-proxy el source IP llega reescrito
+    # como el gateway del bridge — y entonces el `Allow` de tinyproxy deja de
+    # filtrar nada y el proxy queda abierto a quien alcance el puerto.
+    # Acá el filtro lo hace el `Listen` del conf, contra la IP real.
+    network_mode: host
+    volumes:
+      # relativo a la ruta del proyecto: el conf vive al lado de este archivo
+      - ./tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro

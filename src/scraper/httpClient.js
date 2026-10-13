@@ -15,6 +15,7 @@ import { Pool } from "undici";
 import { CookieJar } from "tough-cookie";
 import pLimit from "p-limit";
 import { config } from "../config/config.js";
+import { proxyAgent } from "./proxy.js";
 
 const SEACE_HOST = "https://prod2.seace.gob.pe";
 const FORM_PATH = "/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml";
@@ -24,12 +25,16 @@ export class SeaceHttpSession {
     this.cookies = new CookieJar();
     this.viewState = null;
     this.bootstrapAt = 0;
-    this.pool = new Pool(SEACE_HOST, {
-      keepAliveTimeout: 30_000,
-      keepAliveMaxTimeout: 60_000,
-      connections: 5,
-      pipelining: 1,
-    });
+    // con proxy se pierde el tuning del Pool (keepAlive, connections). No
+    // importa: el lock de abajo deja un POST en vuelo igual.
+    this.pool =
+      proxyAgent() ||
+      new Pool(SEACE_HOST, {
+        keepAliveTimeout: 30_000,
+        keepAliveMaxTimeout: 60_000,
+        connections: 5,
+        pipelining: 1,
+      });
     // Un POST en vuelo por sesión. NO es una política de cortesía: el
     // ViewState de JSF es estado del servidor por sesión, y postForm es un
     // POST-redirect-GET — el POST fija "la ficha actual" y el GET la lee.
@@ -96,6 +101,8 @@ export class SeaceHttpSession {
     // POST inicial. JSF responde 302 con Location → seguimos redirect manual
     // (undici Pool no sigue redirects automáticamente)
     const initial = await this.pool.request({
+      // el Pool lo ignora (ya sabe su host), el ProxyAgent lo necesita
+      origin: SEACE_HOST,
       path: FORM_PATH,
       method: "POST",
       headers: {
@@ -142,6 +149,7 @@ export class SeaceHttpSession {
 
       const cookieStr2 = await this.cookieHeader();
       const next = await this.pool.request({
+        origin: SEACE_HOST,
         path: redirectPath,
         method: "GET",
         headers: {

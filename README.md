@@ -100,6 +100,29 @@ Variables de entorno (ver `.env.example`):
 - `DATABASE_URL` — sin esto el estado va a `data/state/procesos.json` y la API v2 da 503
 - `DOCS_DIR` — default `./data/docs`
 - `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` — sin ninguna, el análisis cae a regex
+- `PROXY_SERVER` / `PROXY_USER` / `PROXY_PASS` — **obligatorio fuera de Perú**
+
+### Geo-bloqueo
+
+SEACE responde 403 a cualquier IP no peruana (medido: `prod2` y `alfprod`,
+con y sin User-Agent de browser; el 403 lo tira el WAF de Oracle Cloud en el
+borde). El contenedor puede correr donde sea, pero el último salto tiene que
+ser peruano — de ahí `PROXY_SERVER`. Un proxy en el mismo VPS de afuera no
+sirve: el egress sigue siendo el mismo.
+
+En producción eso es un tinyproxy en el NAS de Lima, alcanzable por Tailscale
+— ver `deploy/`. IP residencial, que además es menos probable que esté en las
+listas de rangos de datacenter que bloquea el WAF.
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -x "$PROXY_SERVER" \
+  https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml
+```
+
+(en PowerShell, `curl.exe` — `curl` a secas es `Invoke-WebRequest`)
+
+Verificado por las tres rutas de salida: Playwright, el Pool de undici y el
+`fetch` global de las descargas.
 
 ## Stack
 
