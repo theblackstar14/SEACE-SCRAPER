@@ -227,7 +227,13 @@ export function evaluarProceso(requisitos, empresa, opts = {}) {
   let resultado = "no_califica";
   let gap = null;
 
-  if (reqMonto == null) {
+  if (!(empresa.experiencia || []).length) {
+    // Sin obras cargadas, expMonto = 0 y la rama de abajo daría `no_califica`
+    // con una razón convincente — un "no" que en realidad es "no sé". El
+    // perfil vacío es un dato faltante NUESTRO, no un defecto de la empresa.
+    resultado = "indeterminado";
+    razones.push("Perfil de la empresa sin experiencia cargada — no se puede evaluar el monto.");
+  } else if (reqMonto == null) {
     // no pudimos extraer requisito → marcar indeterminado pero NO rechazar
     resultado = "indeterminado";
     razones.push("No se pudo extraer el monto mínimo de experiencia de las Bases.");

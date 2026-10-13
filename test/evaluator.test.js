@@ -37,4 +37,13 @@ const otro = evaluarProceso(
 assert.equal(otro.resultado, "consorcio", "tipo ajeno: monto califica pero especialidad no");
 assert.equal(otro.sugerenciaConsorcio.especialidadIdeal, "Carretera");
 
+// Bug 3: perfil sin experiencia cargada es "no sé", NO "no califica".
+// Si esto se rompe, el ERP muestra rechazos convincentes de un perfil vacío.
+const vacia = evaluarProceso(
+  { experienciaMonto: 2_000_000, tiposObraSimilar: ["edificacion"] },
+  { especialidades: ["edificacion"], experiencia: [] }
+);
+assert.equal(vacia.resultado, "indeterminado", "empresa sin experiencia: no rechazar");
+assert.match(vacia.razones.join(" "), /sin experiencia cargada/);
+
 console.log("ok");

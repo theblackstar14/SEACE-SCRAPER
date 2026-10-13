@@ -466,7 +466,11 @@ function fromEmpresaRow(r) {
   return {
     razonSocial: r.razon_social,
     ruc: r.ruc,
-    capacidadContratacionCAPECO: Number(r.capacidad_contratacion_capeco),
+    // null y no 0: `Number(null)` da 0, y un 0 se lee como "capacidad cero"
+    // en vez de "no cargada". Las dos desactivan el filtro de monto, pero
+    // solo una es honesta en pantalla.
+    capacidadContratacionCAPECO:
+      r.capacidad_contratacion_capeco == null ? null : Number(r.capacidad_contratacion_capeco),
     especialidades: r.especialidades || [],
     experiencia: r.experiencia || [],
     personal: r.personal || [],

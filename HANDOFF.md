@@ -288,7 +288,7 @@ Header `x-api-key: <API_KEY>` en todo.
 | GET | `/api/v2/procesos/:nid` | detalle + documentos |
 | GET | `/api/v2/procesos/:nid/documentos/:ref/download` | **el único link de descarga válido** (§2.3) |
 | PUT/DELETE | `/api/v2/procesos/:nid/pin` | pinear = proteger sus documentos de la purga |
-| GET/PUT | `/api/v2/empresa` | perfil del postor (razón social, RUC, capacidad CAPECO, especialidades, experiencia, personal) |
+| GET/PUT | `/api/v2/empresa` | perfil del postor (razón social, RUC, capacidad CAPECO, especialidades, experiencia, personal). **Lo que se guarda acá es lo que usa el run nocturno** |
 | GET | `/api/v2/ubicaciones` | valores distintos para poblar los selects de filtro |
 | GET | `/api/v2/runs`, `/api/v2/last-run` | historial de corridas |
 
@@ -386,6 +386,12 @@ Una corrida (`src/cli/run-obra.js --http`):
 7. **Persistencia** — run + procesos + documentos a Postgres, archivos a disco
    por hash. Después, purga de lo vencido y no pineado.
 
+El perfil de la empresa sale de **Postgres** si hay `DATABASE_URL`, y recién
+si no, de `data/empresa.json`. La línea `Empresa:` del arranque dice cuál de
+las dos se usó — mirala si una evaluación no cuadra. (Antes siempre leía el
+JSON, así que editar la empresa desde el ERP no cambiaba nada del run
+nocturno. Era silencioso.)
+
 LLM: Anthropic es el primario; Gemini entra cuando el documento es escaneado,
 tiene más de 40 páginas, o más de 100k caracteres (`orchestratorHttp.js:93`).
 Sin ninguna API key, cae a regex y evalúa peor, pero no se rompe.
@@ -409,9 +415,31 @@ provincias) a un `data/ubigeo.json` y reemplazar las dos tablas inline. Es
 trabajo de datos, no de código. **Hasta que eso pase, el filtro por región del
 ERP devuelve vacío**; el de provincia/distrito funciona parcialmente.
 
-**La empresa es de mentira.** Sigue cargada `CONSTRUCTORA DEMO S.A.C.` (RUC
-20512345678). Hasta que no se cargue la real por `PUT /api/v2/empresa`, el
-cruce de plantel y la evaluación no significan nada.
+**La empresa real está a medias.** La empresa es **MM HIGH METRIK ENGINEERS
+S.A.C.**, pero todavía no se cargó: faltan el RUC, la capacidad de
+contratación CAPECO, la experiencia de obras y el personal. En la base sigue
+`CONSTRUCTORA DEMO S.A.C.` (RUC 20512345678) — **los datos que ves evaluados
+hoy son contra una empresa inventada.**
+
+Se carga con `PUT /api/v2/empresa` (o editando `data/empresa.json` si no hay
+DB). Qué mueve cada campo:
+
+| campo | efecto |
+|---|---|
+| `capacidadContratacionCAPECO` | filtro `VR ≤ capacidad × maxMontoRatio` y +5 de score. En `null` el filtro **se desactiva** y pasa todo |
+| `experiencia[]` | **decide `califica` vs `consorcio` vs `no_califica`.** Es el campo que manda |
+| `personal[]` | el cruce de plantel. Es informativo: **no degrada el resultado** (el personal se contrata o subcontrata por obra) |
+| `especialidades[]` | si los tipos de obra no matchean, un `califica` se degrada a `consorcio` |
+
+Con el perfil vacío, **todo da `indeterminado`**. Eso es correcto, no un bug:
+el sistema sirve para *vigilar* licitaciones, no para *decidir*, hasta que se
+cargue la experiencia.
+
+> Ojo con cargarla a medias: antes, un perfil sin experiencia daba
+> `expMonto = 0 < requisito` → **`no_califica`** con una razón convincente. Un
+> "no" que en realidad era "no sé", y nadie iba a sospechar del perfil. Ya hay
+> una guarda explícita en `evaluator.js` y un test que la cubre. Si alguien
+> toca esa rama, que entienda primero por qué está.
 
 **Nunca se vio un `califica`.** En todas las corridas hasta ahora dio 0, pero
 también dio 0 `no_califica` — o sea, ninguna se rechazó por mérito. Todas

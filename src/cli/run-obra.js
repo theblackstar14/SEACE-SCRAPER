@@ -94,8 +94,17 @@ async function main() {
     fechaDesde = formatSeaceDate(desde);
   }
 
-  // cargar empresa
-  const empresa = JSON.parse(await fs.readFile(args.empresa, "utf8"));
+  // cargar empresa: la DB manda si hay DB. Es lo que edita el ERP por
+  // PUT /api/v2/empresa — sin esto, cambiar el perfil desde el ERP no movía
+  // nada del run nocturno, que seguía leyendo el JSON. El archivo queda de
+  // fallback para correr en una laptop sin Postgres.
+  let empresa = null;
+  let empresaFuente = args.empresa;
+  if (isPgAvailable() && !args.noDb) {
+    empresa = await createPgStore().getEmpresaActiva();
+    if (empresa) empresaFuente = "postgres";
+  }
+  if (!empresa) empresa = JSON.parse(await fs.readFile(args.empresa, "utf8"));
 
   const claudeKey = !!process.env.ANTHROPIC_API_KEY;
   const geminiKey = !!process.env.GEMINI_API_KEY;
@@ -121,7 +130,7 @@ async function main() {
   const maxDocMB = args.maxDocMB ?? 150;
 
   console.log(`\nSEACE Obra Pipeline`);
-  console.log(`   Empresa:  ${empresa.razonSocial} (RUC ${empresa.ruc})`);
+  console.log(`   Empresa:  ${empresa.razonSocial} (RUC ${empresa.ruc}) [${empresaFuente}]`);
   console.log(`   Rango:    ${fechaDesde} -> ${fechaHasta}`);
   console.log(`   Limite:   ${args.limit} procesos`);
   console.log(`   Pipeline: ${args.useHttp ? "HTTP DIRECTO (rapido)" : "Playwright (clasico)"}`);
