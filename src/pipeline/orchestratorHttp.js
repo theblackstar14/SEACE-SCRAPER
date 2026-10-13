@@ -14,6 +14,7 @@ import { bootstrapBatchByPage } from "../scraper/bootstrapHttp.js";
 import { fetchDetalleHttp } from "../scraper/fichaHttp.js";
 import { descargarDocHttp } from "../scraper/descargaHttp.js";
 import { parseSeaceDate } from "../scraper/cronograma.js";
+import { parseUbicacionMixed } from "../scraper/ubigeoParser.js";
 import { selectBasesIntegradas, parseSizeMB } from "../scraper/documentos.js";
 import { extractTextFromDoc } from "../pdf/docExtractor.js";
 import { analizarRequisitos } from "../analyzer/requisitos.js";
@@ -537,9 +538,15 @@ export async function runObraPipelineHttp({
   const procesos = enriquecidos
     .map(({ listado: p, detalle, analisis }) => {
       const descripcionFull = detalle?.descripcion || p.descripcion || "";
+      const entidadFinal = detalle?.entidad || p.entidad;
+      const lugarEjecucion = analisis.requisitos?.lugarEjecucion || null;
+      // sin esto region/provincia/distrito quedan null y los filtros
+      // geográficos del ERP no devuelven nada. Lo tenía orchestrator.js (la
+      // ruta Playwright) y nunca se copió acá, que es la que corre de verdad.
+      const ubicacion = parseUbicacionMixed(entidadFinal, lugarEjecucion);
       const proceso = {
         nomenclatura: p.nomenclatura,
-        entidad: detalle?.entidad || p.entidad,
+        entidad: entidadFinal,
         descripcionCorta: descripcionFull.slice(0, 120),
         descripcion: descripcionFull,
         id: p.nidProceso,
@@ -547,6 +554,10 @@ export async function runObraPipelineHttp({
         objeto: detalle?.objeto || p.objetoContratacion,
         valorReferencial: detalle?.vrCuantiaMonto ?? p.vrCuantia ?? null,
         moneda: p.moneda || "PEN",
+        region: ubicacion.region,
+        provincia: ubicacion.provincia,
+        distrito: ubicacion.distrito,
+        lugarEjecucion,
         fechaPublicacion: detalle?.fechaPublicacion || p.fechaPublicacion,
         fechaPropuesta: detalle?.fechaPresentacion?.finIso || detalle?.fechaPresentacion?.fin || null,
         diasRestantes: detalle?.fechaPresentacion?.diasRestantes ?? null,

@@ -114,7 +114,11 @@ async function main() {
   // Default 10× (solo descarta gigantes obvios). ERP filtra dinámico por capacidad.
   const maxMontoRatio = args.maxMontoRatio ?? 10;
   const maxPubDias = args.maxPubDias ?? 30;
-  const maxDocMB = args.maxDocMB ?? 50;
+  // 150 y no 50: el límite viejo asumía un humano esperando. Corriendo de
+  // madrugada, un `bases.rar` de 67 MB cuesta un minuto más y un proceso
+  // saltado no se evalúa nunca. Los defaults de orchestrator*.js siguen en
+  // 50 porque ahí sí puede haber alguien del otro lado (la API v1).
+  const maxDocMB = args.maxDocMB ?? 150;
 
   console.log(`\nSEACE Obra Pipeline`);
   console.log(`   Empresa:  ${empresa.razonSocial} (RUC ${empresa.ruc})`);
